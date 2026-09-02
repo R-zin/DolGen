@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff lint
+        run: ruff check app.py main.py tests
+      - name: Ruff format check
+        run: ruff format --check app.py main.py tests
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install system libraries for trimesh
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0
+      - name: Install Python dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Byte-compile sources
+        run: python -m py_compile app.py main.py
+      - name: Run offline pipeline tests
+        run: pytest -q

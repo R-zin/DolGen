@@ -25,6 +25,7 @@ Modal setup (secrets are intentionally NOT baked into this file):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -85,6 +86,20 @@ MAX_ASSET_BYTES = 64 * 1024 * 1024          # 64 MB per downloaded asset cap
 
 ASSET_BASE_URL = os.environ.get("ASSET_BASE_URL", "https://api.sketchfab.com/v3")
 ASSET_API_TOKEN = os.environ.get("ASSET_API_TOKEN")
+# How many downloadable search candidates to try per furniture piece before
+# falling back to a procedural mesh — makes "matches the extraction" far more
+# likely than the old single top-hit.
+ASSET_TOP_K = int(os.environ.get("ASSET_TOP_K", "3"))
+
+# Downloaded GLBs are cached by search query so repeat runs skip the network.
+# A Modal volume named "dolgen-assets" is mounted here when it exists; locally
+# (or if the volume is absent) this just falls back to a tmp dir.
+ASSET_CACHE_DIR = os.environ.get("ASSET_CACHE_DIR", "/cache/assets")
+try:
+    os.makedirs(ASSET_CACHE_DIR, exist_ok=True)
+except OSError:  # read-only / nonexistent mount (e.g. local run) — use tmp
+    ASSET_CACHE_DIR = os.path.join("/tmp", "dolgen-assets")
+    os.makedirs(ASSET_CACHE_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -123,10 +138,18 @@ Rules:
 - element_type "furniture": movable objects only (bed, sofa, table, chair, desk, wardrobe, bathtub,
   toilet, sink, stove, fridge, ...). The box is the object's top-down floor footprint. Also set:
     * furniture_class      -> a short lower-case class name, e.g. "bed", "sofa", "dining_table"
-    * asset_search_query   -> a 3-5 word natural-language search query that would find a good
-                              3D model of this object in a 3D asset library,
-                              e.g. "modern double bed frame", "white ceramic toilet"
+    * asset_search_query   -> a specific natural-language search query (type + material + color +
+                              style) that would find a good 3D model of THIS object in a 3D asset
+                              library, e.g. "modern grey fabric sectional sofa", "oak queen bed frame",
+                              "white ceramic pedestal sink"
+- asset_search_query should describe the SPECIFIC object, not a generic category: include
+  type + material + color + style, e.g. "modern grey fabric sectional sofa", "oak queen bed frame",
+  "white ceramic pedestal sink". This query is used verbatim to fetch a matching 3D model from
+  a web asset library, so make it visually faithful to what is drawn.
 - furniture_class and asset_search_query MUST be null when element_type is not "furniture".
+- If a room's fill color or a clear label implies a wall/room color, add a top-level "room_colors"
+  object mapping a short room name to a hex color string, e.g. {"bedroom": "#c8d6e8"}. If nothing
+  is implied, omit it or return an empty object.
 - Ignore text labels, dimension lines, arrows, scale bars and north symbols.
 
 Be thorough: missing walls or furniture makes the 3D model wrong."""
@@ -285,13 +308,17 @@ def boolean_difference(wall: trimesh.Trimesh, cutters: list[trimesh.Trimesh]) ->
     return wall
 
 
-def build_shell(elements: list[dict[str, Any]]) -> tuple[trimesh.Scene, list[str]]:
+def build_shell(
+    elements: list[dict[str, Any]],
+    wall_material: Optional[trimesh.visual.material.PBRMaterial] = None,
+    floor_material: Optional[trimesh.visual.material.PBRMaterial] = None,
+) -> tuple[trimesh.Scene, list[str]]:
     """Build floor + walls with door/window openings. Returns (scene, log lines)."""
     logs: list[str] = []
     scene = trimesh.Scene()
 
-    white = pbr_material((238, 238, 234, 255), "wall_white")
-    wood = pbr_material((196, 154, 108, 255), "floor_light_wood")
+    white = wall_material or pbr_material((238, 238, 234, 255), "wall_white")
+    wood = floor_material or pbr_material((196, 154, 108, 255), "floor_light_wood")
 
     # Floor spans the whole image footprint, slab extends below z=0.
     floor = scale_mesh([0, 0, 1000, 1000], -FLOOR_THICKNESS, 0.0)
@@ -378,43 +405,95 @@ def build_shell(elements: list[dict[str, Any]]) -> tuple[trimesh.Scene, list[str
 # Dynamic asset fetching (Sketchfab-compatible) — graceful skip on any failure
 # ---------------------------------------------------------------------------
 
+def _cache_key(query: str) -> str:
+    return hashlib.sha256(query.strip().lower().encode("utf-8")).hexdigest()[:24] + ".glb"
+
+
+def _looks_like_glb(data: bytes) -> bool:
+    return len(data) >= 12 and data[:4] == b"glTF"
+
+
+def _glb_parses(data: bytes) -> bool:
+    """Cheap validity gate: a candidate only 'matches' if trimesh can load it
+    and it has real geometry — otherwise we keep looking."""
+    try:
+        mesh = _as_one_mesh(trimesh.load(io.BytesIO(data), file_type="glb", force="mesh", process=False))
+        return bool(np.all(np.isfinite(mesh.extents)) and mesh.extents.max() > 1e-5)
+    except Exception:
+        return False
+
+
 async def _fetch_one_asset(
     client: httpx.AsyncClient, query: str
 ) -> tuple[Optional[bytes], str]:
-    """Search for a downloadable model, return its .glb bytes or (None, reason)."""
+    """Fetch a furniture asset from the web asset library that *matches* `query`.
+
+    Instead of taking the first search hit, walk the top-`ASSET_TOP_K`
+    downloadable candidates and return the first whose .glb both downloads and
+    actually parses — so the placed model is far more likely to resemble what
+    Gemini extracted. Results are cached on disk keyed by query.
+    """
+    key = _cache_key(query)
+    cached = os.path.join(ASSET_CACHE_DIR, key)
+    if os.path.exists(cached):
+        try:
+            with open(cached, "rb") as fh:
+                return fh.read(), "cache"
+        except OSError:
+            pass  # fall through to the network
+
     headers = {"Authorization": f"Bearer {ASSET_API_TOKEN}"} if ASSET_API_TOKEN else {}
     try:
         search = await client.get(
             f"{ASSET_BASE_URL}/search",
-            params={"type": "models", "q": query, "downloadable": "true"},
+            params={"type": "models", "q": query, "downloadable": "true", "count": str(ASSET_TOP_K)},
             headers=headers,
         )
         search.raise_for_status()
-        results = search.json().get("results") or []
+        results = (search.json().get("results") or [])[: max(ASSET_TOP_K, 1)]
         if not results:
             return None, f"no downloadable results for '{query}'"
-        uid = results[0]["uid"]
 
-        dl = await client.post(f"{ASSET_BASE_URL}/models/{uid}/download", headers=headers)
-        dl.raise_for_status()
-        payload = dl.json()
-        fmt = payload.get("glb") or payload.get("gltf") or {}
-        url = fmt.get("url") if isinstance(fmt, dict) else None
-        if not isinstance(fmt, dict) or not url:
-            # Some APIs return a list of format entries.
-            url = None
-            for entry in payload if isinstance(payload, list) else [payload]:
-                if isinstance(entry, dict) and entry.get("url"):
-                    url = entry["url"]
-                    break
-        if not url:
-            return None, "no direct .glb/.gltf url in download response"
+        last_err = "no usable candidate"
+        for hit in results:
+            uid = hit.get("uid") if isinstance(hit, dict) else None
+            if not uid:
+                continue
+            try:
+                dl = await client.post(f"{ASSET_BASE_URL}/models/{uid}/download", headers=headers)
+                dl.raise_for_status()
+                payload = dl.json()
+                fmt = payload.get("glb") or payload.get("gltf") or {}
+                url = fmt.get("url") if isinstance(fmt, dict) else None
+                if not isinstance(fmt, dict) or not url:
+                    url = None
+                    for entry in payload if isinstance(payload, list) else [payload]:
+                        if isinstance(entry, dict) and entry.get("url"):
+                            url = entry["url"]
+                            break
+                if not url:
+                    last_err = "no direct .glb/.gltf url in download response"
+                    continue
 
-        resp = await client.get(url, headers=headers, follow_redirects=True)
-        resp.raise_for_status()
-        if len(resp.content) > MAX_ASSET_BYTES:
-            return None, f"asset too large ({len(resp.content)} bytes)"
-        return resp.content, "ok"
+                resp = await client.get(url, headers=headers, follow_redirects=True)
+                resp.raise_for_status()
+                data = resp.content
+                if len(data) > MAX_ASSET_BYTES:
+                    last_err = f"asset too large ({len(data)} bytes)"
+                    continue
+                if _looks_like_glb(data) and _glb_parses(data):
+                    try:
+                        with open(cached, "wb") as fh:
+                            fh.write(data)
+                    except OSError:
+                        pass
+                    return data, "ok"
+                last_err = "candidate was not a loadable GLB"
+            except httpx.HTTPStatusError as exc:
+                last_err = f"download HTTP {exc.response.status_code}"
+            except Exception as exc:  # keep trying the next candidate
+                last_err = f"{type(exc).__name__}: {exc}"
+        return None, f"all {len(results)} candidates failed ({last_err})"
     except httpx.HTTPStatusError as exc:
         return None, f"asset API HTTP {exc.response.status_code}"
     except Exception as exc:
@@ -487,16 +566,251 @@ def normalize_furniture_to_box(mesh: trimesh.Trimesh, box: list[int]) -> trimesh
 
 
 # ---------------------------------------------------------------------------
+# Procedural furniture fallback (used when the web asset library has no match)
+# ---------------------------------------------------------------------------
+
+def _part(extents: tuple[float, float, float], offset: tuple[float, float, float],
+          mat: trimesh.visual.material.PBRMaterial) -> trimesh.Trimesh:
+    """A single box primitive at a local offset (min-corner anchored at origin)."""
+    m = trimesh.creation.box(extents=extents)
+    m.apply_translation((offset[0] + extents[0] / 2, offset[1] + extents[1] / 2, offset[2] + extents[2] / 2))
+    return mesh_with_material(m, mat)
+
+
+def _concat(parts: list[trimesh.Trimesh]) -> trimesh.Trimesh:
+    return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+
+
+def _proc_bed(w: float, d: float, fab, wood) -> trimesh.Trimesh:
+    frame_h, matt_h, head_h, pillow_h = 0.30, 0.22, 0.95, 0.12
+    return _concat([
+        _part((w, d, frame_h), (0, 0, 0), wood),                                   # frame
+        _part((w, d * 0.12, head_h), (0, d * 0.88, 0), wood),                      # headboard
+        _part((w * 0.94, d * 0.82, matt_h), (w * 0.03, d * 0.03, frame_h), fab),   # mattress
+        _part((w * 0.40, d * 0.20, pillow_h), (w * 0.08, d * 0.66, frame_h + matt_h), fab),  # pillows
+        _part((w * 0.40, d * 0.20, pillow_h), (w * 0.52, d * 0.66, frame_h + matt_h), fab),
+    ])
+
+
+def _proc_sofa(w: float, d: float, fab, _wood) -> trimesh.Trimesh:
+    base_h, back_h, arm_h, arm_w = 0.40, 0.85, 0.60, min(0.18, w * 0.12)
+    seat_d = d - arm_w
+    return _concat([
+        _part((w, seat_d, base_h), (0, 0, 0), fab),                                # seat base
+        _part((w, d - seat_d, back_h), (0, seat_d, 0), fab),                       # backrest
+        _part((arm_w, d, arm_h), (0, 0, 0), fab),                                  # left arm
+        _part((arm_w, d, arm_h), (w - arm_w, 0, 0), fab),                          # right arm
+        _part((w - 2 * arm_w, seat_d * 0.9, 0.12), (arm_w, 0, base_h), fab),       # seat cushion
+    ])
+
+
+def _proc_table(w: float, d: float, wood, _fab) -> trimesh.Trimesh:
+    top_h, top_t, leg = 0.74, 0.04, 0.06
+    inset = leg * 0.6
+    leg_h = top_h - top_t
+    parts = [_part((w, d, top_t), (0, 0, leg_h), wood)]
+    for ox in (inset, w - inset - leg):
+        for oy in (inset, d - inset - leg):
+            parts.append(_part((leg, leg, leg_h), (ox, oy, 0), wood))
+    return _concat(parts)
+
+
+def _proc_chair(w: float, d: float, wood, _fab) -> trimesh.Trimesh:
+    seat_h, seat_t, back_h, leg = 0.45, 0.04, 0.90, 0.045
+    parts = [
+        _part((w, d, seat_t), (0, 0, seat_h - seat_t), wood),                      # seat
+        _part((w, seat_t, back_h - seat_h), (0, d - seat_t, seat_h), wood),        # backrest
+    ]
+    for ox in (0.0, w - leg):
+        for oy in (0.0, d - leg):
+            parts.append(_part((leg, leg, seat_h), (ox, oy, 0), wood))
+    return _concat(parts)
+
+
+def _proc_desk(w: float, d: float, wood, _fab) -> trimesh.Trimesh:
+    top_h, top_t = 0.74, 0.04
+    return _concat([
+        _part((w, d, top_t), (0, 0, top_h - top_t), wood),                         # top
+        _part((top_t, d, top_h), (0, 0, 0), wood),                                 # left panel
+        _part((top_t, d, top_h), (w - top_t, 0, 0), wood),                         # right panel
+    ])
+
+
+def _proc_wardrobe(w: float, d: float, wood, _fab) -> trimesh.Trimesh:
+    h = min(2.0, WALL_HEIGHT * 0.8)
+    handle = _part((0.03, 0.03, 0.18), (w / 2 - 0.015, -0.02, h / 2), pbr_material((90, 90, 95, 255), "handle"))
+    return _concat([_part((w, d, h), (0, 0, 0), wood), handle])
+
+
+def _proc_bathtub(w: float, d: float, ceram, _fab) -> trimesh.Trimesh:
+    h, rim = 0.55, 0.08
+    wall = 0.06
+    parts = [
+        _part((w, d, 0.06), (0, 0, 0), ceram),                                     # base
+        _part((w, rim, h), (0, 0, 0), ceram),                                      # near side
+        _part((w, rim, h), (0, d - rim, 0), ceram),                                # far side
+        _part((wall, d - 2 * rim, h), (0, rim, 0), ceram),                         # ends
+        _part((wall, d - 2 * rim, h), (w - wall, rim, 0), ceram),
+    ]
+    return _concat(parts)
+
+
+def _proc_toilet(w: float, d: float, ceram, _fab) -> trimesh.Trimesh:
+    return _concat([
+        _part((w * 0.7, d * 0.6, 0.42), (w * 0.15, 0, 0), ceram),                  # bowl
+        _part((w, d * 0.32, 0.75), (0, d * 0.66, 0), ceram),                       # cistern
+    ])
+
+
+def _proc_sink(w: float, d: float, ceram, _fab) -> trimesh.Trimesh:
+    return _concat([
+        _part((w * 0.16, w * 0.16, 0.78), (w / 2 - w * 0.08, d / 2 - w * 0.08, 0), ceram),  # pedestal
+        _part((w, d, 0.12), (0, 0, 0.78), ceram),                                  # basin
+    ])
+
+
+def _proc_stove(w: float, d: float, metal, _fab) -> trimesh.Trimesh:
+    h = 0.9
+    body = _part((w, d, h), (0, 0, 0), metal)
+    dark = pbr_material((35, 35, 38, 255), "burner")
+    r = min(w, d) * 0.18
+    parts = [body]
+    for ox, oy in ((0.28, 0.28), (0.72, 0.28), (0.28, 0.72), (0.72, 0.72)):
+        c = trimesh.creation.cylinder(radius=r, height=0.02, sections=20)
+        c.apply_translation((w * ox, d * oy, h + 0.01))
+        parts.append(mesh_with_material(c, dark))
+    return _concat(parts)
+
+
+def _proc_fridge(w: float, d: float, metal, _fab) -> trimesh.Trimesh:
+    h = 1.8
+    body = _part((w, d, h), (0, 0, 0), metal)
+    seam = _part((w + 0.005, d + 0.005, 0.01), (-0.0025, -0.0025, h * 0.62), pbr_material((70, 70, 74, 255), "seam"))
+    handle = _part((0.03, 0.03, 0.5), (w * 0.06, -0.02, h * 0.65), pbr_material((70, 70, 74, 255), "handle"))
+    return _concat([body, seam, handle])
+
+
+def _proc_generic(w: float, d: float, a, _b) -> trimesh.Trimesh:
+    return _part((w, d, 0.5), (0, 0, 0), a)
+
+
+def build_procedural_furniture(furniture_class: str, box: list[int]) -> trimesh.Trimesh:
+    """Synthesize a simple recognizable mesh for `furniture_class` that fits the
+    footprint `box`. Used when no downloadable asset matches, so rooms are never
+    left empty. The local mesh is built at the footprint's real size, then
+    grounded/scaled into place by the caller via normalize_furniture_to_box.
+    """
+    ymin, xmin, ymax, xmax = box
+    w = max((xmax - xmin) * SCALE, 0.2)
+    d = max((ymax - ymin) * SCALE, 0.2)
+
+    wood = pbr_material((150, 110, 74, 255), "proc_wood")
+    fab = pbr_material((120, 132, 150, 255), "proc_fabric")
+    ceram = pbr_material((238, 240, 242, 255), "proc_ceramic")
+    metal = pbr_material((200, 203, 208, 255), "proc_metal")
+
+    cls = (furniture_class or "").lower()
+    builder, mat = _proc_generic, wood
+    if "bed" in cls:
+        builder, mat = _proc_bed, fab
+    elif any(k in cls for k in ("sofa", "couch", "sectional", "loveseat")):
+        builder, mat = _proc_sofa, fab
+    elif "dining" in cls or ("table" in cls and "bed" not in cls):
+        builder, mat = _proc_table, wood
+    elif "chair" in cls or "stool" in cls or "armchair" in cls:
+        builder, mat = _proc_chair, wood
+    elif "desk" in cls:
+        builder, mat = _proc_desk, wood
+    elif any(k in cls for k in ("wardrobe", "closet", "cabinet", "dresser", "bookshelf", "shelf")):
+        builder, mat = _proc_wardrobe, wood
+    elif "bath" in cls or "tub" in cls:
+        builder, mat = _proc_bathtub, ceram
+    elif "toilet" in cls or "wc" in cls:
+        builder, mat = _proc_toilet, ceram
+    elif "sink" in cls or "vanity" in cls or "basin" in cls:
+        builder, mat = _proc_sink, ceram
+    elif "stove" in cls or "oven" in cls or "cooktop" in cls or "range" in cls:
+        builder, mat = _proc_stove, metal
+    elif "fridge" in cls or "refrigerator" in cls or "freezer" in cls:
+        builder, mat = _proc_fridge, metal
+
+    return builder(w, d, mat, fab)
+
+
+# ---------------------------------------------------------------------------
+# Ceiling / roof
+# ---------------------------------------------------------------------------
+
+def build_ceiling() -> trimesh.Trimesh:
+    """A thin slab over the whole footprint, sitting on top of the walls."""
+    slab = scale_mesh([0, 0, 1000, 1000], WALL_HEIGHT, WALL_HEIGHT + 0.12)
+    return mesh_with_material(slab, pbr_material((236, 235, 231, 255), "ceiling"))
+
+
+# ---------------------------------------------------------------------------
+# Room wall coloring
+# ---------------------------------------------------------------------------
+
+def _hex_to_rgba(value: Any) -> Optional[tuple[int, int, int, int]]:
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        return None
+    try:
+        r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        return None
+    # Pull toward a bright wall tone so colors read as paint, not neon.
+    blend = 0.55
+    r = int(r + (238 - r) * (1 - blend))
+    g = int(g + (238 - g) * (1 - blend))
+    b = int(b + (234 - b) * (1 - blend))
+    return (r, g, b, 255)
+
+
+def _room_wall_material(room_colors: Optional[dict[str, Any]]) -> trimesh.visual.material.PBRMaterial:
+    """Pick a single accent wall color from Gemini's room_colors (average)."""
+    if not room_colors:
+        return pbr_material((238, 238, 234, 255), "wall_white")
+    rgba = None
+    for v in room_colors.values():
+        rgba = _hex_to_rgba(v)
+        if rgba:
+            break
+    if not rgba:
+        return pbr_material((238, 238, 234, 255), "wall_white")
+    return pbr_material(rgba, "wall_room")
+
+
+# ---------------------------------------------------------------------------
 # POST /generate-3d
 # ---------------------------------------------------------------------------
 
 def assemble_glb_bytes(
     elements: list[dict[str, Any]],
     furniture_assets: list[tuple[dict[str, Any], bytes]],
+    include_ceiling: bool = False,
+    room_colors: Optional[dict[str, Any]] = None,
 ) -> tuple[bytes, list[str]]:
-    scene, logs = build_shell(elements)
+    wall_mat = _room_wall_material(room_colors)
+    scene, logs = build_shell(elements, wall_material=wall_mat)
 
-    placed = 0
+    # Optional ceiling/roof. The node is named "ceiling" so the viewer can hide it.
+    if include_ceiling:
+        scene.add_geometry(build_ceiling(), node_name="ceiling", geom_name="ceiling")
+        logs.append("Added ceiling/roof slab.")
+
+    if room_colors:
+        logs.append(f"Applied room wall tint from Gemini room_colors ({len(room_colors)} room(s)).")
+
+    placed_real = 0
+    placed_proc = 0
+    fetched_boxes = {id(el) for el, _ in furniture_assets}
+    real_nodes: list[str] = []
+
     for i, (el, data) in enumerate(furniture_assets):
         name = el.get("furniture_class") or f"furniture_{i}"
         try:
@@ -505,11 +819,45 @@ def assemble_glb_bytes(
             mesh = normalize_furniture_to_box(mesh, el["box_2d"])
             node = f"furn_{i}_{name}"
             scene.add_geometry(mesh, node_name=node, geom_name=node)
-            placed += 1
+            real_nodes.append(node)
+            placed_real += 1
         except Exception as exc:
-            logs.append(f"Could not place asset for '{name}' ({type(exc).__name__}: {exc}) — skipping.")
-    if furniture_assets:
-        logs.append(f"Placed {placed}/{len(furniture_assets)} downloaded furniture assets.")
+            logs.append(f"Could not place asset for '{name}' ({type(exc).__name__}: {exc}) — will synthesize instead.")
+            fetched_boxes.discard(id(el))
+
+    # Procedural fallback: every furniture element that did NOT get a real asset
+    # becomes a recognizable placeholder so no room is left empty.
+    furniture_elements = [e for e in elements if e["element_type"] == "furniture"]
+    for j, el in enumerate(furniture_elements):
+        if id(el) in fetched_boxes:
+            continue
+        name = el.get("furniture_class") or "furniture"
+        try:
+            mesh = build_procedural_furniture(name, el["box_2d"])
+            mesh = normalize_furniture_to_box(mesh, el["box_2d"])
+            node = f"proc_{j}_{name}"
+            scene.add_geometry(mesh, node_name=node, geom_name=node)
+            placed_proc += 1
+        except Exception as exc:
+            logs.append(f"Could not synthesize placeholder for '{name}' ({type(exc).__name__}: {exc}) — skipping.")
+
+    if furniture_elements:
+        logs.append(
+            f"Furniture: {placed_real} matched asset(s) from the web, "
+            f"{placed_proc} procedural placeholder(s), {len(furniture_elements)} total."
+        )
+
+    # Stash a small manifest in the GLB's scene extras so the viewer can tell
+    # ceiling/real/procedural nodes apart.
+    try:
+        scene.metadata["dolgen"] = {
+            "ceiling_node": "ceiling" if include_ceiling else None,
+            "real_furniture": real_nodes,
+            "placed_real": placed_real,
+            "placed_procedural": placed_proc,
+        }
+    except Exception:
+        pass
 
     glb = scene.export(file_type="glb")
     logs.append(f"Exported dollhouse GLB ({len(glb)//1024} KB).")
@@ -524,7 +872,11 @@ def create_app() -> FastAPI:
         return HTMLResponse(INDEX_HTML)
 
     @web.post("/generate-3d")
-    async def generate_3d(file: UploadFile = File(...)) -> StreamingResponse:
+    async def generate_3d(
+        file: UploadFile = File(...),
+        ceiling: str = "false",
+        room_colors: str = "",
+    ) -> StreamingResponse:
         mime = (file.content_type or "").lower()
         data = await file.read()
         if not data:
@@ -544,8 +896,21 @@ def create_app() -> FastAPI:
             # Walls are the backbone of the dollhouse; without them the output is misleading.
             raise HTTPException(status_code=422, detail="Gemini detected no walls in this floorplan.")
 
+        # Optional per-room wall colors suggested by Gemini (or sent by the client).
+        colors: Optional[dict[str, Any]] = None
+        if room_colors:
+            try:
+                obj = json.loads(room_colors)
+                if isinstance(obj, dict):
+                    colors = obj
+            except (ValueError, TypeError):
+                logger.info("Ignoring malformed room_colors form field")
+        include_ceiling = str(ceiling).lower() in ("1", "true", "yes", "on")
+
         furniture_assets, asset_logs = await download_assets(elements)
-        glb, scene_logs = assemble_glb_bytes(elements, furniture_assets)
+        glb, scene_logs = assemble_glb_bytes(
+            elements, furniture_assets, include_ceiling=include_ceiling, room_colors=colors
+        )
 
         logs = asset_logs + scene_logs
         logger.info("generate_3d ok: %s", " | ".join(logs))
@@ -643,6 +1008,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .dots span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%,80%,100% { opacity:.15; } 40% { opacity:1; } }
   #busymsg { font-size: 13px; color: #c7ceda; }
+  .row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #aeb6c2; flex-wrap: wrap; }
+  .row label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+  .row input[type="checkbox"] { accent-color: #e8b04b; width: 15px; height: 15px; cursor: pointer; }
+  .row input[type="range"] { accent-color: #e8b04b; flex: 1; min-width: 90px; }
+  .row .val { color: #e8b04b; font-variant-numeric: tabular-nums; min-width: 3.2em; text-align: right; }
+  #dl {
+    background: transparent; border: 1px solid #3a404c; color: #aeb6c2; font-size: 12.5px;
+    padding: 8px 12px; border-radius: 8px; cursor: pointer; transition: border-color .15s, color .15s;
+  }
+  #dl:not(:disabled):hover { border-color: #e8b04b; color: #e8b04b; }
+  #dl:disabled { opacity: .45; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -654,6 +1030,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
     <div id="filename"></div>
     <button id="go" disabled>Generate Path-Traced Dollhouse</button>
+    <div class="row">
+      <label><input type="checkbox" id="ceil" /> Ceiling / roof</label>
+      <label><input type="checkbox" id="spin" /> Auto-rotate</label>
+    </div>
+    <div class="row">
+      <label for="quality">Quality</label>
+      <input type="range" id="quality" min="128" max="4096" step="128" value="1024" />
+      <span class="val" id="qualityVal">1024</span>
+    </div>
+    <button id="dl" disabled>⬇ Download .glb</button>
     <div id="stats"></div>
     <div id="log"></div>
   </aside>
@@ -688,6 +1074,11 @@ const busyEl = document.getElementById('busy');
 const emptyEl = document.getElementById('empty');
 const filenameEl = document.getElementById('filename');
 const viewEl = document.getElementById('view');
+const ceilEl = document.getElementById('ceil');
+const spinEl = document.getElementById('spin');
+const dlEl = document.getElementById('dl');
+const qualityEl = document.getElementById('quality');
+const qualityValEl = document.getElementById('qualityVal');
 
 function log(msg, cls = '') {
   const div = document.createElement('div');
@@ -732,19 +1123,38 @@ camera.position.set(9, 11, 9);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.target.set(0, 0.5, 0);
+controls.autoRotateSpeed = 1.4;
 
 const pathTracer = new WebGLPathTracer(renderer);
 pathTracer.tiles = 3;
 pathTracer.renderScale = 0.85;
 pathTracer.dynamicLowRes = true;
+pathTracer.targetSamples = parseInt(qualityEl.value, 10);
 pathTracer.setCamera(camera);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1d22);
 
-let emptyScene = true, convergedLogged = false;
+let emptyScene = true, convergedLogged = false, lastGlbBuf = null;
+let ceilingMesh = null, ceilingOn = false;
 
 pathTracer.setScene(scene, camera);
+
+function retarget() {
+  pathTracer.targetSamples = parseInt(qualityEl.value, 10);
+  pathTracer.reset();
+  convergedLogged = false;
+}
+qualityEl.addEventListener('input', () => { qualityValEl.textContent = qualityEl.value; });
+qualityEl.addEventListener('change', retarget);
+
+function setCeilingVisible(visible) {
+  ceilingOn = visible;
+  if (ceilingMesh) ceilingMesh.visible = visible;
+  pathTracer.reset();
+  convergedLogged = false;
+}
+ceilEl.addEventListener('change', () => setCeilingVisible(ceilEl.checked));
 
 controls.addEventListener('change', () => {
   pathTracer.reset();
@@ -764,6 +1174,7 @@ new ResizeObserver(resize).observe(viewEl);
 resize();
 
 renderer.setAnimationLoop(() => {
+  controls.autoRotate = spinEl.checked;
   controls.update();
   if (emptyScene || camera.position.y <= 0.03) {
     pathTracer.reset();
@@ -799,6 +1210,7 @@ async function generate() {
   try {
     const form = new FormData();
     form.append('file', pickedFile);
+    form.append('ceiling', ceilEl.checked ? 'true' : 'false');
     const res = await fetch('/generate-3d', { method: 'POST', body: form });
     if (!res.ok) {
       let detail = await res.text();
@@ -809,6 +1221,8 @@ async function generate() {
     if (serverLog) serverLog.split(' | ').forEach(l => log(l, l.includes('failed') ? 'err' : ''));
 
     const buf = await res.arrayBuffer();
+    lastGlbBuf = buf;
+    dlEl.disabled = false;
     log(`Received ${(buf.byteLength / 1024).toFixed(0)} KB GLB — loading…`);
     const gltf = await new GLTFLoader().parseAsync(buf, '');
 
@@ -816,6 +1230,13 @@ async function generate() {
     scene.add(gltf.scene);
     emptyScene = false;
     emptyEl.style.display = 'none';
+
+    // If the model has a ceiling node, show/hide it per the checkbox.
+    ceilingMesh = null;
+    gltf.scene.traverse(o => { if (!ceilingMesh && o.name === 'ceiling') ceilingMesh = o; });
+    setCeilingVisible(ceilEl.checked && !!ceilingMesh);
+    if (ceilEl.checked && !ceilingMesh) log('No ceiling slab in this model (it was not generated).', 'err');
+
     fitCameraToObject(gltf.scene);
 
     pathTracer.updateCamera();
@@ -832,6 +1253,20 @@ async function generate() {
   }
 }
 goBtn.addEventListener('click', generate);
+
+dlEl.addEventListener('click', () => {
+  if (!lastGlbBuf) return;
+  const blob = new Blob([lastGlbBuf], { type: 'model/gltf-binary' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'dollhouse.glb';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  log('Saved dollhouse.glb', 'ok');
+});
 </script>
 </body>
 </html>

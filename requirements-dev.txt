@@ -1,0 +1,18 @@
+-r requirements.txt
+
+# CI / local dev tooling
+ruff
+pytest
+pytest-asyncio
+
+# Runtime deps of app.py exercised by the offline tests (app.py itself is
+# deployed to Modal, which installs its own image; these let CI import and
+# test the pure-geometry pipeline without any secrets or network).
+fastapi
+python-multipart
+google-genai
+trimesh[all]
+manifold3d>=2.3.0
+scipy
+networkx
+httpx
