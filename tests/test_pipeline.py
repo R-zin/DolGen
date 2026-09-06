@@ -125,3 +125,75 @@ def test_cache_key_is_stable():
     a = app._cache_key("Oak Queen Bed Frame")
     b = app._cache_key("  oak queen bed frame ")
     assert a == b and a.endswith(".glb")
+
+
+# --- AI-generated furniture (Gemini image model "nano banana pro") ----------
+
+# 1x1 white PNG
+_PNG_1PX = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
+    b"\x00\x00\x00\x03\x00\x01\x00\x05\xfe\xd4\x8f\x1d\x00\x00\x00\x00IEND"
+    b"\xaeB`\x82"
+)
+
+
+def _make_png(w: int = 64, h: int = 48, rgb=(255, 255, 255)) -> bytes:
+    from PIL import Image
+
+    img = Image.new("RGB", (w, h), rgb)
+    buf = app.io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_crop_pad_floorplan_returns_square_png():
+    plan = _make_png(1000, 1000)
+    out = app._crop_pad_floorplan(plan, [200, 200, 420, 400])
+    assert out is not None
+    from PIL import Image
+
+    im = Image.open(app.io.BytesIO(out))
+    assert im.size[0] == im.size[1]  # square canvas
+    assert im.size[0] > 0
+
+
+def test_crop_pad_floorplan_degenerate_returns_none():
+    plan = _make_png(100, 100)
+    assert app._crop_pad_floorplan(plan, [0, 0, 0, 0]) is None
+    assert app._crop_pad_floorplan(b"not an image", [0, 0, 100, 100]) is None
+
+
+def test_build_ai_furniture_glb_produces_valid_glb():
+    tex = _make_png(32, 32, (180, 120, 80))
+    data = app.build_ai_furniture_glb("sofa", [0, 0, 100, 100], tex)
+    assert data is not None
+    assert app._looks_like_glb(data)
+    assert app._glb_parses(data)
+    # it loads as a mesh with a texture applied
+    mesh = app.trimesh.load(app.io.BytesIO(data), file_type="glb", force="mesh", process=False)
+    assert mesh.visual is not None
+
+
+def test_build_ai_furniture_glb_bad_texture_returns_none():
+    assert app.build_ai_furniture_glb("bed", [0, 0, 100, 100], b"garbage") is None
+
+
+def test_image_response_may_retry_codes():
+    class FakeErr(Exception):
+        def __init__(self, code):
+            self.code = code
+            super().__init__(str(code))
+
+    if app.GenAIClientError is None:
+        import pytest as _p
+
+        _p.skip("google-genai ClientError not available")
+    # Build real ClientError instances
+    from google.genai.errors import ClientError
+
+    e429 = ClientError(code=429, response_json={"error": {"message": "quota"}})
+    e400 = ClientError(code=400, response_json={"error": {"message": "bad"}})
+    assert app._image_response_may_retry(e429) is True
+    assert app._image_response_may_retry(e400) is False
+    assert app._image_response_may_retry(FakeErr(503)) is False  # not a ClientError

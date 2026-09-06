@@ -4,16 +4,21 @@ DolGen — turn a 2D floorplan image into a path-traced 3D dollhouse.
 Pipeline (per POST /generate-3d request):
   1. Gemini 2.5 Pro (temperature=0.0, strict JSON schema) extracts walls / doors /
      windows / furniture as 2D boxes normalized to a 0-1000 image coordinate system.
-  2. Furniture elements are resolved to downloadable .glb assets via a
-     Sketchfab-compatible asset API. Any failure gracefully skips that piece.
+  2. Furniture elements are resolved to .glb models. In "auto" mode each piece
+     first tries a Sketchfab-compatible asset API, then falls back to an
+     AI-generated model: the furniture's footprint is cropped from the floorplan,
+     Gemini 3 Pro Image ("nano banana pro") renders it as a clean top-down
+     product image, and that image is texture-mapped onto a procedural mesh and
+     exported as a .glb. Any failure falls back to an untextured procedural mesh.
   3. Trimesh assembles the dollhouse: 2.5 m walls, boolean-cut door/window
      openings, PBR materials (white walls, light-wood floor), furniture scaled
      and placed inside its 2D footprint.
   4. The merged scene is exported as binary GLTF (.glb) and streamed back with
      media type 'model/gltf-binary'.
 
-GET / serves a Three.js viewer that renders the GLB with three-gpu-pathtracer
-(progressive path tracing + ACES filmic tone mapping) — no <model-viewer>.
+GET / serves a legacy Three.js viewer (zero-build fallback). The primary
+frontend is the React app in frontend/ (Vite) which renders the GLB with
+three-gpu-pathtracer (progressive path tracing + ACES filmic tone mapping).
 
 Modal setup (secrets are intentionally NOT baked into this file):
   modal secret create gemini-secret GEMINI_API_KEY=...
@@ -36,11 +41,17 @@ import httpx
 import modal
 import numpy as np
 import trimesh
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from google import genai
 from google.genai import types as genai_types
 from pydantic import BaseModel, field_validator
+
+try:  # precise error type when the installed google-genai exposes it
+    from google.genai.errors import ClientError as GenAIClientError
+except Exception:  # pragma: no cover - older SDKs
+    GenAIClientError = None  # type: ignore[assignment]
 
 logger = logging.getLogger("dolgen")
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -63,6 +74,7 @@ image = (
         "scipy",
         "networkx",
         "httpx",
+        "pillow",  # crop floorplan + build texture images for AI furniture
     )
 )
 
@@ -81,8 +93,22 @@ WALL_THICKNESS = 0.15      # meters
 FLOOR_THICKNESS = 0.10     # meters (floor slab extends downward from z=0)
 
 GEMINI_MODEL = "gemini-2.5-pro"
+# Image model ("nano banana pro" / Gemini 3 Pro Image) used to render per-furniture
+# top-down views for AI-generated GLB textures. Overridable because Google renames
+# preview model IDs as they go stable.
+GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
 MAX_IMAGE_BYTES = 20 * 1024 * 1024          # 20 MB upload cap
 MAX_ASSET_BYTES = 64 * 1024 * 1024          # 64 MB per downloaded asset cap
+
+# Cross-origin access for the React dev server / any deployed static frontend.
+# The Vite dev server proxies /generate-3d, so this is mainly for direct calls.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if o.strip()
+]
 
 ASSET_BASE_URL = os.environ.get("ASSET_BASE_URL", "https://api.sketchfab.com/v3")
 ASSET_API_TOKEN = os.environ.get("ASSET_API_TOKEN")
@@ -525,6 +551,230 @@ async def download_assets(
 
 
 # ---------------------------------------------------------------------------
+# AI-generated furniture models (Gemini image model "nano banana pro")
+#
+# For each furniture piece we crop its footprint out of the uploaded floorplan,
+# ask the Gemini image model to render that piece as a clean top-down product
+# photo, texture-map the image onto a procedural mesh of the piece, and export
+# it as a self-contained .glb — which then flows through the exact same
+# placement path as a downloaded asset (normalize_furniture_to_box). Any failure
+# yields None and the caller falls back to the untextured procedural mesh.
+# ---------------------------------------------------------------------------
+
+AI_FURNITURE_PROMPT = """You are given a crop of a 2D architectural floorplan showing one piece of furniture
+(a {furniture_class}).
+
+Render THIS object as a photorealistic, perfectly top-down (orthographic plan view) product
+image of the real 3D piece it represents. The camera is directly overhead, looking straight
+down.
+
+Requirements:
+- The piece faces the same direction as in the floorplan (same orientation in the frame).
+- The piece is centered and fills most of the frame, with a small even margin on all sides.
+- Background: pure solid white (#ffffff), nothing else in the image.
+- Soft, even studio lighting with a subtle contact shadow.
+- No text, labels, dimension lines, borders, floor lines, or other objects."""
+
+
+def _image_response_may_retry(exc: Exception) -> bool:
+    """429/5xx (and UNAVAILABLE/RESOURCE_EXHAUSTED) are worth one retry."""
+    if GenAIClientError is not None and isinstance(exc, GenAIClientError):
+        code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        return code in (408, 409, 425, 429, 500, 502, 503, 504)
+    return False
+
+
+def _decode_image_bytes(part: Any) -> bytes | None:
+    """Best-effort extraction of PNG/JPEG bytes from a google-genai response part."""
+    try:
+        img = part.as_image()
+        if img is not None:
+            if getattr(img, "image_bytes", None):
+                return img.image_bytes
+            if getattr(img, "_loaded_image", None) is not None:
+                buf = io.BytesIO()
+                img._loaded_image.save(buf, format="PNG")
+                return buf.getvalue()
+    except Exception:
+        pass
+    inline = getattr(part, "inline_data", None)
+    if inline is not None and getattr(inline, "data", None):
+        data = inline.data
+        if isinstance(data, str):  # some SDK versions hand back base64 text
+            import base64
+
+            try:
+                return base64.b64decode(data)
+            except Exception:
+                return None
+        return bytes(data)
+    return None
+
+
+def _crop_pad_floorplan(
+    image_bytes: bytes, box: list[int], pad_frac: float = 0.15
+) -> bytes | None:
+    """Crop a furniture footprint (0-1000 image units) out of the floorplan PNG."""
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - pillow is in the Modal image
+        return None
+    ymin, xmin, ymax, xmax = box
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        return None
+    W, H = im.size
+    x0 = xmin / 1000.0 * W
+    x1 = xmax / 1000.0 * W
+    y0 = ymin / 1000.0 * H
+    y1 = ymax / 1000.0 * H
+    w, h = x1 - x0, y1 - y0
+    if w < 2 or h < 2:
+        return None
+    px, py = w * pad_frac, h * pad_frac
+    crop = im.crop((
+        max(0, int(x0 - px)),
+        max(0, int(y0 - py)),
+        min(W, int(x1 + px)),
+        min(H, int(y1 + py)),
+    ))
+    side = max(crop.size)
+    canvas = Image.new("RGB", (side, side), (255, 255, 255))
+    canvas.paste(crop, ((side - crop.size[0]) // 2, (side - crop.size[1]) // 2))
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def _gen_furniture_view(
+    client: genai.Client, crop_png: bytes, el: dict[str, Any]
+) -> bytes | None:
+    """One Gemini image-model render of the furniture piece (top-down view)."""
+    prompt = AI_FURNITURE_PROMPT.format(
+        furniture_class=el.get("furniture_class") or "furniture"
+    )
+    if el.get("asset_search_query"):
+        prompt += f"\nFor reference, the piece looks like: {el['asset_search_query']}."
+    contents = [
+        genai_types.Part.from_bytes(data=crop_png, mime_type="image/png"),
+        prompt,
+    ]
+    cfg_kwargs: dict[str, Any] = {"temperature": 1.0}
+    try:  # IMAGE-only modality where the SDK exposes it
+        cfg_kwargs["response_modalities"] = ["IMAGE"]
+    except Exception:
+        pass
+    try:
+        cfg_kwargs["image_config"] = genai_types.ImageConfig(aspect_ratio="1:1")
+    except Exception:
+        pass
+    config = genai_types.GenerateContentConfig(**cfg_kwargs)
+
+    for attempt in (1, 2):
+        try:
+            resp = await client.aio.models.generate_content(
+                model=GEMINI_IMAGE_MODEL, contents=contents, config=config
+            )
+        except Exception as exc:
+            if attempt == 1 and _image_response_may_retry(exc):
+                await asyncio.sleep(2.0)
+                continue
+            logger.info("Gemini image generation failed: %s", exc)
+            return None
+        try:
+            for part in resp.parts or []:
+                data = _decode_image_bytes(part)
+                if data:
+                    return data
+        except Exception:
+            pass
+        return None
+    return None
+
+
+def _top_texture(mesh: trimesh.Trimesh, image_bytes: bytes) -> None:
+    """Planar-project `image_bytes` (a top-down render) onto the top of `mesh`.
+
+    UV u/v run along the mesh's x/y extents, so after placement the texture is
+    aligned with the furniture's footprint (both come from the same 2D box).
+    """
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    b = mesh.bounds
+    span_x = max(float(b[1][0] - b[0][0]), 1e-6)
+    span_y = max(float(b[1][1] - b[0][1]), 1e-6)
+    uv = np.column_stack([
+        (mesh.vertices[:, 0] - b[0][0]) / span_x,
+        (mesh.vertices[:, 1] - b[0][1]) / span_y,
+    ])
+    mat = trimesh.visual.material.PBRMaterial(
+        name="ai_top",
+        image=img,
+        baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+        metallicFactor=0.0,
+        roughnessFactor=0.9,
+    )
+    mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=mat)
+
+
+def build_ai_furniture_glb(
+    furniture_class: str, box: list[int], view_png: bytes
+) -> bytes | None:
+    """Textured procedural piece -> standalone .glb, or None on any failure."""
+    try:
+        mesh = build_procedural_furniture(furniture_class or "furniture", box)
+        _top_texture(mesh, view_png)
+        data = mesh.export(file_type="glb")
+        return data if _looks_like_glb(data) else None
+    except Exception as exc:
+        logger.info("AI furniture glb build failed: %s", exc)
+        return None
+
+
+async def generate_ai_furniture_assets(
+    elements: list[dict[str, Any]], image_bytes: bytes
+) -> tuple[list[tuple[dict[str, Any], bytes]], list[str]]:
+    """Generate .glb models for furniture pieces via the Gemini image model."""
+    furniture = [e for e in elements if e["element_type"] == "furniture"]
+    logs = [
+        f"Generating AI models for {len(furniture)} furniture piece(s) "
+        f"with {GEMINI_IMAGE_MODEL}..."
+    ]
+    if not furniture:
+        return [], logs
+    try:
+        client = genai.Client()
+    except Exception as exc:
+        return [], [
+            f"Gemini client unavailable for image generation ({exc}) — no AI furniture."
+        ]
+
+    async def one(el: dict[str, Any]) -> bytes | None:
+        crop = _crop_pad_floorplan(image_bytes, el["box_2d"])
+        if crop is None:
+            return None
+        view = await _gen_furniture_view(client, crop, el)
+        if view is None:
+            return None
+        return build_ai_furniture_glb(el.get("furniture_class") or "furniture", el["box_2d"], view)
+
+    results = await asyncio.gather(*(one(el) for el in furniture))
+    ok: list[tuple[dict[str, Any], bytes]] = []
+    for el, data in zip(furniture, results, strict=True):
+        name = el.get("furniture_class") or "furniture"
+        if data is None:
+            logs.append(
+                f"AI model generation failed for '{name}' — procedural fallback will be used."
+            )
+        else:
+            logs.append(f"AI-generated model for '{name}' ({len(data)//1024} KB).")
+            ok.append((el, data))
+    return ok, logs
+
+
+# ---------------------------------------------------------------------------
 # Furniture normalization / placement
 # ---------------------------------------------------------------------------
 
@@ -867,15 +1117,31 @@ def assemble_glb_bytes(
 def create_app() -> FastAPI:
     web = FastAPI(title="DolGen — Floorplan to 3D Dollhouse")
 
+    # The React frontend (Vite dev server or a deployed static build) calls
+    # /generate-3d cross-origin; the custom headers must be exposed for the
+    # pipeline log / furniture source to be readable from JS.
+    web.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["X-DolGen-Log", "X-DolGen-Furniture", "Content-Disposition"],
+    )
+
     @web.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         return HTMLResponse(INDEX_HTML)
 
+    @web.get("/api/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
     @web.post("/generate-3d")
     async def generate_3d(
         file: UploadFile = File(...),
-        ceiling: str = "false",
-        room_colors: str = "",
+        ceiling: str = Form("false"),
+        room_colors: str = Form(""),
+        furniture_source: str = Form("auto"),
     ) -> StreamingResponse:
         mime = (file.content_type or "").lower()
         data = await file.read()
@@ -887,6 +1153,13 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=422, detail=f"Unsupported upload type '{file.content_type}'. Send an image (png/jpg/webp).")
         if not mime.startswith("image/"):
             mime = "image/png"
+
+        furniture_source = (furniture_source or "auto").strip().lower()
+        if furniture_source not in ("auto", "assets", "ai", "procedural"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown furniture_source '{furniture_source}' (auto|assets|ai|procedural).",
+            )
 
         parsed = await extract_elements(data, mime)
         elements = normalize_elements(parsed)
@@ -907,7 +1180,31 @@ def create_app() -> FastAPI:
                 logger.info("Ignoring malformed room_colors form field")
         include_ceiling = str(ceiling).lower() in ("1", "true", "yes", "on")
 
-        furniture_assets, asset_logs = await download_assets(elements)
+        # Resolve furniture models per the requested source.
+        asset_logs: list[str] = []
+        if furniture_source == "procedural":
+            furniture_assets: list[tuple[dict[str, Any], bytes]] = []
+            mode_label = "procedural"
+        elif furniture_source == "assets":
+            furniture_assets, asset_logs = await download_assets(elements)
+            mode_label = "assets"
+        elif furniture_source == "ai":
+            furniture_assets, asset_logs = await generate_ai_furniture_assets(elements, data)
+            mode_label = "ai"
+        else:  # auto: web asset library first, AI generation for the misses
+            furniture_assets, asset_logs = await download_assets(elements)
+            matched = {id(el) for el, _ in furniture_assets}
+            remaining = [
+                e
+                for e in elements
+                if e["element_type"] == "furniture" and id(e) not in matched
+            ]
+            if remaining:
+                ai_assets, ai_logs = await generate_ai_furniture_assets(remaining, data)
+                furniture_assets = furniture_assets + ai_assets
+                asset_logs += ai_logs
+            mode_label = "auto"
+
         glb, scene_logs = assemble_glb_bytes(
             elements, furniture_assets, include_ceiling=include_ceiling, room_colors=colors
         )
@@ -922,6 +1219,7 @@ def create_app() -> FastAPI:
             headers={
                 "Content-Disposition": 'attachment; filename="dollhouse.glb"',
                 "X-DolGen-Log": header_log,
+                "X-DolGen-Furniture": mode_label,
             },
         )
 
