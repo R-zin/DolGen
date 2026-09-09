@@ -92,7 +92,7 @@ WALL_HEIGHT = 2.5          # meters
 WALL_THICKNESS = 0.15      # meters
 FLOOR_THICKNESS = 0.10     # meters (floor slab extends downward from z=0)
 
-GEMINI_MODEL = "gemini-2.5-pro"
+GEMINI_MODEL = "gemini-3.8-flash"
 # Image model ("nano banana pro" / Gemini 3 Pro Image) used to render per-furniture
 # top-down views for AI-generated GLB textures. Overridable because Google renames
 # preview model IDs as they go stable.

@@ -1,4 +1,4 @@
-import { useEffect, useImperativeHandle, useRef, forwardRef } from 'react'
+import { Component, useEffect, useImperativeHandle, useRef, forwardRef } from 'react'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
@@ -232,4 +232,57 @@ function disposeObject(root) {
   })
 }
 
-export default PathTracerView
+// A WebGL/path-tracer init failure (GPU blocklisted, headless browser, old
+// three-gpu-pathtracer on this device) must not take the whole app down with
+// it — without this boundary the error bubbles to the root and the page goes
+// black, panel included.
+class PathTracerErrorBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
+  }
+  static getDerivedStateFromError(error) {
+    return { error }
+  }
+  componentDidCatch(error, info) {
+    console.error('PathTracerView crashed:', error, info)
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#ff7b72',
+            fontSize: 13,
+            textAlign: 'center',
+            padding: 24,
+          }}
+        >
+          <div style={{ fontSize: 32 }}>⚠</div>
+          <div>The 3D viewer failed to start (WebGL unavailable?).</div>
+          <div style={{ color: '#8f98a5', fontFamily: 'monospace', fontSize: 11.5 }}>
+            {String(this.state.error?.message || this.state.error)}
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+const PathTracerViewWithBoundary = forwardRef(function PathTracerViewWithBoundary(props, ref) {
+  return (
+    <PathTracerErrorBoundary>
+      <PathTracerView ref={ref} {...props} />
+    </PathTracerErrorBoundary>
+  )
+})
+
+export default PathTracerViewWithBoundary
