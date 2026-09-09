@@ -75,6 +75,16 @@ image = (
         "networkx",
         "httpx",
         "pillow",  # crop floorplan + build texture images for AI furniture
+        # Open-weights furniture renderer (FLUX.1 Kontext [dev]) — torch/cuda
+        # come preinstalled on Modal's debian_slim GPU base, diffusers pulls
+        # the rest. Imported lazily inside the GPU class so the CPU web
+        # container never pays the import cost.
+        "torch",
+        "diffusers>=0.35.0",
+        "transformers",
+        "accelerate",
+        "sentencepiece",
+        "safetensors",
     )
 )
 
@@ -97,6 +107,18 @@ GEMINI_MODEL = "gemini-3.8-flash"
 # top-down views for AI-generated GLB textures. Overridable because Google renames
 # preview model IDs as they go stable.
 GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
+
+# Which backend renders AI furniture top-down views:
+#   "gemini"       (default) — Gemini image model, per-call pricing, no GPU
+#   "openweights"            — FLUX.1 Kontext [dev] on a Modal GPU container
+# Containers scale to zero when idle (scaledown_window=2s, the smallest Modal
+# accepts): every cold start pays the model-load time, nothing is paid idle.
+AI_IMAGE_BACKEND = os.environ.get("AI_IMAGE_BACKEND", "gemini").strip().lower()
+OPENWEIGHTS_MODEL = os.environ.get("OPENWEIGHTS_MODEL", "black-forest-labs/FLUX.1-Kontext-dev")
+# Volume caching the HF weights so cold starts after the first are seconds,
+# not a 30+ GB download. Created automatically on first deploy.
+WEIGHTS_VOLUME_NAME = os.environ.get("WEIGHTS_VOLUME_NAME", "dolgen-weights")
+WEIGHTS_DIR = "/weights"
 MAX_IMAGE_BYTES = 20 * 1024 * 1024          # 20 MB upload cap
 MAX_ASSET_BYTES = 64 * 1024 * 1024          # 64 MB per downloaded asset cap
 
@@ -561,6 +583,79 @@ async def download_assets(
 # yields None and the caller falls back to the untextured procedural mesh.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Open-weights furniture renderer (FLUX.1 Kontext [dev] on Modal GPU)
+#
+# Active only when AI_IMAGE_BACKEND=openweights. The class holds the pipeline
+# in a GPU container; containers scale to zero when idle (scaledown_window=0)
+# so nothing is paid while unused — the cost is that every cold start pays
+# the model-load time (seconds once WEIGHTS_DIR is warm, minutes on the very
+# first pull). Every render failure returns None and the caller falls back to
+# the Gemini image model, then to a procedural mesh, per the usual layering.
+# ---------------------------------------------------------------------------
+
+OPENWEIGHTS_PROMPT = """Turn this 2D architectural floorplan symbol (a {furniture_class}) into a
+photorealistic, perfectly top-down (orthographic plan view) product photo of the real 3D piece.
+Camera directly overhead, looking straight down. Keep the piece's orientation in the frame
+exactly as drawn. Center it, filling most of the frame with a small even margin. Pure solid
+white background (#ffffff), soft even studio lighting, subtle contact shadow. No text, labels,
+dimension lines, borders, floor lines, or other objects.{style_hint}"""
+
+
+@app.cls(
+    image=image,
+    gpu="L40S",
+    volumes={WEIGHTS_DIR: modal.Volume.from_name(WEIGHTS_VOLUME_NAME, create_if_missing=True)},
+    secrets=[modal.Secret.from_name("gemini-secret")],  # HF_TOKEN can live here if the repo is gated
+    scaledown_window=2,      # cold-only: scale to zero right after each call (Modal min is 2s)
+    timeout=900,             # generous for first-ever weights download
+    memory=32768,
+)
+class FurnitureRenderer:
+    """Holds a loaded FLUX.1 Kontext pipeline for the lifetime of one warm container."""
+
+    @modal.enter()
+    def load_pipeline(self) -> None:
+        import torch
+        from diffusers import FluxKontextPipeline
+
+        logger.info("Loading %s onto GPU (cold start)...", OPENWEIGHTS_MODEL)
+        self.pipe = FluxKontextPipeline.from_pretrained(
+            OPENWEIGHTS_MODEL,
+            torch_dtype=torch.bfloat16,
+            cache_dir=WEIGHTS_DIR,
+        )
+        self.pipe.to("cuda")
+        logger.info("Furniture renderer ready.")
+
+    @modal.method()
+    def render(self, crop_png: bytes, furniture_class: str, style_hint: str) -> bytes | None:
+        """One top-down product render of the furniture piece, as PNG bytes."""
+        import io as _io
+
+        from PIL import Image
+
+        try:
+            init_image = Image.open(_io.BytesIO(crop_png)).convert("RGB")
+            prompt = OPENWEIGHTS_PROMPT.format(
+                furniture_class=furniture_class or "furniture",
+                style_hint=f"\nFor reference, the piece looks like: {style_hint}." if style_hint else "",
+            )
+            out = self.pipe(
+                image=init_image,
+                prompt=prompt,
+                guidance_scale=2.5,
+                num_inference_steps=28,
+            )
+            img = out.images[0]
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as exc:
+            logger.info("Open-weights render failed for '%s': %s", furniture_class, exc)
+            return None
+
+
 AI_FURNITURE_PROMPT = """You are given a crop of a 2D architectural floorplan showing one piece of furniture
 (a {furniture_class}).
 
@@ -647,10 +742,41 @@ def _crop_pad_floorplan(
     return buf.getvalue()
 
 
+async def _gen_furniture_view_openweights(crop_png: bytes, el: dict[str, Any]) -> bytes | None:
+    """Render via the GPU-resident FLUX.1 Kontext pipeline. None on any failure
+    (the caller then tries Gemini, then a procedural mesh)."""
+    try:
+        renderer = FurnitureRenderer()
+        return await renderer.render.remote.aio(
+            crop_png,
+            el.get("furniture_class") or "furniture",
+            el.get("asset_search_query") or "",
+        )
+    except Exception as exc:
+        logger.info("Open-weights backend unavailable: %s", exc)
+        return None
+
+
 async def _gen_furniture_view(
     client: genai.Client, crop_png: bytes, el: dict[str, Any]
 ) -> bytes | None:
-    """One Gemini image-model render of the furniture piece (top-down view)."""
+    """One render of the furniture piece (top-down view).
+
+    Backend chosen by AI_IMAGE_BACKEND: "openweights" tries the GPU pipeline
+    first and falls back to the Gemini image model on failure; "gemini" (the
+    default) goes straight to the Gemini image model.
+    """
+    if AI_IMAGE_BACKEND == "openweights":
+        data = await _gen_furniture_view_openweights(crop_png, el)
+        if data is not None:
+            return data
+        logger.info(
+            "Falling back to Gemini image model for '%s'.",
+            el.get("furniture_class") or "furniture",
+        )
+    elif AI_IMAGE_BACKEND != "gemini":
+        logger.warning("Unknown AI_IMAGE_BACKEND '%s' — using gemini.", AI_IMAGE_BACKEND)
+
     prompt = AI_FURNITURE_PROMPT.format(
         furniture_class=el.get("furniture_class") or "furniture"
     )
