@@ -30,6 +30,7 @@ Modal setup (secrets are intentionally NOT baked into this file):
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -46,6 +47,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from google import genai
 from google.genai import types as genai_types
+from openai import AsyncOpenAI
 from pydantic import BaseModel, field_validator
 
 try:  # precise error type when the installed google-genai exposes it
@@ -67,6 +69,7 @@ image = (
         "fastapi",
         "python-multipart",
         "google-genai",
+        "openai",
         # trimesh[all] covers the glTF stack; manifold3d lives in trimesh's *easy*
         # extra, not [all], so it must be pinned explicitly for boolean operations.
         "trimesh[all]",
@@ -102,7 +105,20 @@ WALL_HEIGHT = 2.5          # meters
 WALL_THICKNESS = 0.15      # meters
 FLOOR_THICKNESS = 0.10     # meters (floor slab extends downward from z=0)
 
-GEMINI_MODEL = "gemini-3.8-flash"
+# Floorplan-extraction LLM: Kimi K3 (vision) served as an OpenAI-compatible
+# Modal proxy endpoint. The proxy authenticates with the workspace's
+# MODAL_PROXY_TOKEN_ID / MODAL_PROXY_TOKEN_SECRET joined by a dot.
+KIMI_BASE_URL = os.environ.get(
+    "KIMI_BASE_URL", "https://content-do--ep-kimi-k3-server.us-west.modal.direct/v1"
+)
+KIMI_MODEL = os.environ.get("KIMI_MODEL", "moonshotai/Kimi-K3")
+
+
+def _kimi_api_key() -> str:
+    """Modal proxy endpoints take '<token_id>.<token_secret>' as the API key."""
+    token_id = os.environ.get("MODAL_PROXY_TOKEN_ID", "wk-FdegwHxb4Ut1MxVa3YZsyr")
+    token_secret = os.environ.get("MODAL_PROXY_TOKEN_SECRET", "ws-5FcFsksBUoYtOgOxWPXCBy")
+    return f"{token_id}.{token_secret}"
 # Image model ("nano banana pro" / Gemini 3 Pro Image) used to render per-furniture
 # top-down views for AI-generated GLB textures. Overridable because Google renames
 # preview model IDs as they go stable.
@@ -174,7 +190,8 @@ class FloorElement(BaseModel):
 GEMINI_PROMPT = """You are an architectural floorplan understanding engine.
 
 Extract every structural element and every piece of furniture visible in this floorplan image,
-and return ONLY a JSON array matching the provided schema.
+and return ONLY a JSON object matching the provided schema: a top-level object with an
+"elements" array (and optionally "room_colors").
 
 Rules:
 - box_2d = [ymin, xmin, ymax, xmax] as integers normalized to 0-1000, where (0,0) is the
@@ -199,52 +216,71 @@ Rules:
   object mapping a short room name to a hex color string, e.g. {"bedroom": "#c8d6e8"}. If nothing
   is implied, omit it or return an empty object.
 - Ignore text labels, dimension lines, arrows, scale bars and north symbols.
+- Respond with a single JSON object only: {"elements": [...], "room_colors": {...}}. Wrap the
+  element array in the top-level "elements" key; "room_colors" may be omitted or empty.
 
 Be thorough: missing walls or furniture makes the 3D model wrong."""
 
 
 async def extract_elements(image_bytes: bytes, mime_type: str) -> list[FloorElement]:
-    """Call Gemini 2.5 Pro on the floorplan; return validated elements."""
+    """Call Kimi K3 (vision) on the floorplan; return validated elements."""
     try:
-        client = genai.Client()  # authenticates from the GEMINI_API_KEY env var (gemini-secret)
-    except Exception as exc:  # pragma: no cover - depends on runtime secrets
+        client = AsyncOpenAI(base_url=KIMI_BASE_URL, api_key=_kimi_api_key())
+    except Exception as exc:  # pragma: no cover - depends on runtime config
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Gemini client could not be created (is the 'gemini-secret' Modal secret "
-                f"with GEMINI_API_KEY configured?): {exc}"
-            ),
+            detail=f"Kimi client could not be created (KIMI_BASE_URL / proxy token): {exc}",
         )
 
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
     try:
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                GEMINI_PROMPT,
+        completion = await client.chat.completions.create(
+            model=KIMI_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{b64_image}"},
+                        },
+                        {"type": "text", "text": GEMINI_PROMPT},
+                    ],
+                }
             ],
-            config=genai_types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-                response_schema=list[FloorElement],
-            ),
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            # Kimi K3 always reasons (it cannot disable thinking); "low" is the
+            # cheapest setting the endpoint accepts.
+            extra_body={"reasoning_effort": "low"},
         )
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Gemini analysis failed: {exc}")
+        raise HTTPException(status_code=422, detail=f"Kimi analysis failed: {exc}")
 
-    parsed = response.parsed
-    if parsed is None and getattr(response, "text", None):
-        # Fallback: validate the raw JSON text ourselves.
+    text = (completion.choices[0].message.content or "").strip() if completion.choices else ""
+    elements: list[Any] = []
+    if text:
         try:
-            parsed = [FloorElement.model_validate(o) for o in json.loads(response.text)]
+            obj = json.loads(text)
+            # JSON mode returns an object; the element array lives under "elements".
+            if isinstance(obj, dict):
+                obj = obj.get("elements", [])
+            if isinstance(obj, list):
+                elements = obj
+        except (json.JSONDecodeError, AttributeError):
+            elements = []
+    parsed = []
+    for o in elements:
+        try:
+            parsed.append(FloorElement.model_validate(o))
         except Exception:
-            parsed = None
+            continue
     if not parsed:
         raise HTTPException(
             status_code=422,
-            detail="Gemini returned no extractable elements for this floorplan image.",
+            detail="Kimi returned no extractable elements for this floorplan image.",
         )
-    return list(parsed)
+    return parsed
 
 
 def normalize_elements(parsed: list[FloorElement]) -> list[dict[str, Any]]:
@@ -399,30 +435,55 @@ def build_shell(
         return scale_mesh(new_box, 0.0, WALL_HEIGHT)
 
     def opening_cutters_through(wall_mesh: trimesh.Trimesh, op: dict[str, Any], kind: str) -> Optional[trimesh.Trimesh]:
-        """Build a cutter for a door/window that is guaranteed to span the wall's
-        thin axis (so the boolean produces a real through-hole even if the 2D boxes
-        of the wall and opening don't perfectly overlap)."""
+        """Build a cutter for a door/window through THIS wall.
+
+        The opening only cuts this wall if its 2D footprint actually sits on the
+        wall: the two must overlap along the wall's long axis, and the opening's
+        center must lie on (within a tolerance of) the wall's thin axis. Without
+        this gate every window/door in the plan was punching a hole through every
+        wall it geometrically crossed — e.g. a window on the north wall also
+        blowing a full-height gap through the parallel south wall.
+        """
         oymin, oxmin, oymax, oxmax = op["box_2d"]
         wall_ext = wall_mesh.extents          # meters
         thin_axis = 0 if wall_ext[0] < wall_ext[1] else 1
         long_axis = 1 - thin_axis
         z_min, z_max = opening_hparams(op["box_2d"], kind)
 
-        # Hole width: the opening's real extent along the wall's LONG axis, in meters.
-        if long_axis == 0:
-            op_long_lo, op_long_hi = oxmin * SCALE, oxmax * SCALE
-        else:
-            op_long_lo, op_long_hi = -oymax * SCALE, -oymin * SCALE
-        if op_long_hi - op_long_lo <= 1e-3:
-            return None
+        # The opening's 2D box as a physical rectangle (matching scale_mesh's y-flip).
+        op_x_lo, op_x_hi = oxmin * SCALE, oxmax * SCALE
+        op_y_lo, op_y_hi = -oymax * SCALE, -oymin * SCALE
+        op_lo = (op_x_lo, op_y_lo)
+        op_hi = (op_x_hi, op_y_hi)
+
+        # 1) Long-axis overlap: the opening must share a real span with this wall.
+        w_long_lo = wall_mesh.bounds[0, long_axis]
+        w_long_hi = wall_mesh.bounds[1, long_axis]
+        ov_lo = max(op_lo[long_axis], w_long_lo)
+        ov_hi = min(op_hi[long_axis], w_long_hi)
+        if ov_hi - ov_lo <= 1e-3:
+            return None  # opening doesn't reach this wall along its length
+
+        # 2) Thin-axis proximity: the opening's center must sit on the wall.
+        #    Tolerance = wall half-thickness + a little slack for a loosely drawn box.
+        w_thin_lo = wall_mesh.bounds[0, thin_axis]
+        w_thin_hi = wall_mesh.bounds[1, thin_axis]
+        op_thin_mid = (op_lo[thin_axis] + op_hi[thin_axis]) / 2
+        thin_slack = (w_thin_hi - w_thin_lo) / 2 + 0.35  # ~wall half-thickness + 0.35 m
+        if not (w_thin_lo - thin_slack) <= op_thin_mid <= (w_thin_hi + thin_slack):
+            return None  # opening is on a different (e.g. parallel) wall
+
+        # Hole width: clamp the opening's long-axis span to the wall segment so a
+        # box drawn wider than the wall can't over-cut into the room.
+        op_long_lo, op_long_hi = ov_lo, ov_hi
 
         # Cutter thin span = wall thin span + margin, so it passes fully through.
         margin = 0.05
         lo = [0.0, 0.0, z_min]
         hi = [0.0, 0.0, z_max]
         lo[long_axis], hi[long_axis] = op_long_lo, op_long_hi
-        lo[thin_axis] = wall_mesh.bounds[0, thin_axis] - margin
-        hi[thin_axis] = wall_mesh.bounds[1, thin_axis] + margin
+        lo[thin_axis] = w_thin_lo - margin
+        hi[thin_axis] = w_thin_hi + margin
         extents = (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
         if min(extents) <= 1e-4:
             return None

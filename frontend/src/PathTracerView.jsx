@@ -5,6 +5,44 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
 import { WebGLPathTracer } from 'three-gpu-pathtracer'
 
+// three-gpu-pathtracer 0.0.24's EquirectHdrInfoUniform reads
+// `scene.environment.image.{width,height,data}`, so `scene.environment` must be
+// an equirectangular *DataTexture*. `pmrem.fromScene()` returns a PMREM cubeUV
+// render-target texture whose `.image` is undefined — assigning it directly
+// crashes setScene with "Cannot read properties of undefined (reading '0')".
+// Render RoomEnvironment into a float equirect DataTexture instead.
+function makeEquirectEnv(renderer, width = 512, height = 256) {
+  const envScene = new RoomEnvironment()
+  const pmrem = new THREE.PMREMGenerator(renderer)
+  const cubeRT = pmrem.fromScene(envScene, 0.04)
+
+  const rt = new THREE.WebGLRenderTarget(width, height, {
+    type: THREE.FloatType,
+    format: THREE.RGBAFormat,
+    colorSpace: THREE.LinearSRGBColorSpace,
+    depthBuffer: false,
+  })
+  const blitCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
+  const blitScene = new THREE.Scene()
+  blitScene.background = cubeRT.texture
+  const prevRT = renderer.getRenderTarget()
+  renderer.setRenderTarget(rt)
+  renderer.render(blitScene, blitCam)
+  renderer.setRenderTarget(prevRT)
+
+  const data = new Float32Array(width * height * 4)
+  renderer.readRenderTargetPixels(rt, 0, 0, width, height, data)
+
+  cubeRT.dispose()
+  pmrem.dispose()
+  rt.dispose()
+
+  const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType)
+  tex.mapping = THREE.EquirectangularReflectionMapping
+  tex.needsUpdate = true
+  return tex
+}
+
 /**
  * A three-gpu-pathtracer viewport.
  *
@@ -41,36 +79,63 @@ const PathTracerView = forwardRef(function PathTracerView(
   // one-time renderer/scene/pathtracer setup
   useEffect(() => {
     const host = hostRef.current
-    const renderer = new THREE.WebGLRenderer({ antialias: true })
-    renderer.toneMapping = THREE.ACESFilmicToneMapping
-    renderer.toneMappingExposure = 1.0
-    renderer.outputColorSpace = THREE.SRGBColorSpace
-    renderer.setPixelRatio(window.devicePixelRatio)
-    host.appendChild(renderer.domElement)
+    // Tag each init stage so a failure says WHICH step broke (the error
+    // boundary surfaces the tag; see step() below).
+    const step = (name, fn) => {
+      try {
+        return fn()
+      } catch (e) {
+        e.message = `[init:${name}] ${e.message}`
+        throw e
+      }
+    }
 
-    const scene = new THREE.Scene()
-    scene.background = new THREE.Color(0x1a1d22)
-    // Environment lighting so the path tracer has something to bounce.
-    const pmrem = new THREE.PMREMGenerator(renderer)
-    const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture
-    scene.environment = envTex
-    scene.environmentIntensity = 0.9
+    const renderer = step('renderer', () => {
+      const r = new THREE.WebGLRenderer({ antialias: true })
+      r.toneMapping = THREE.ACESFilmicToneMapping
+      r.toneMappingExposure = 1.0
+      r.outputColorSpace = THREE.SRGBColorSpace
+      r.setPixelRatio(window.devicePixelRatio)
+      host.appendChild(r.domElement)
+      return r
+    })
 
-    const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 500)
-    camera.position.set(9, 11, 9)
+    let scene, envTex
+    step('environment', () => {
+      scene = new THREE.Scene()
+      scene.background = new THREE.Color(0x1a1d22)
+      // Environment lighting as an equirect DataTexture (see makeEquirectEnv).
+      envTex = makeEquirectEnv(renderer)
+      scene.environment = envTex
+      scene.environmentIntensity = 0.9
+    })
 
-    const controls = new OrbitControls(camera, renderer.domElement)
-    controls.enableDamping = true
-    controls.dampingFactor = 0.08
-    controls.target.set(0, 0.5, 0)
-    controls.autoRotateSpeed = 1.4
+    const camera = step('camera', () => {
+      const c = new THREE.PerspectiveCamera(45, 1, 0.05, 500)
+      c.position.set(9, 11, 9)
+      return c
+    })
 
-    const pathTracer = new WebGLPathTracer(renderer)
-    pathTracer.tiles = 3
-    pathTracer.renderScale = 0.85
-    pathTracer.dynamicLowRes = true
-    pathTracer.minSamples = 3
-    pathTracer.setScene(scene, camera)
+    const controls = step('controls', () => {
+      const c = new OrbitControls(camera, renderer.domElement)
+      c.enableDamping = true
+      c.dampingFactor = 0.08
+      c.target.set(0, 0.5, 0)
+      c.autoRotateSpeed = 1.4
+      return c
+    })
+
+    const pathTracer = step('pathtracer', () => {
+      const pt = new WebGLPathTracer(renderer)
+      // In three-gpu-pathtracer 0.0.24 `tiles` is a read-only getter returning
+      // the inner renderer's Vector2 — mutate it via .set() rather than assigning.
+      pt.tiles.set(3, 3)
+      pt.renderScale = 0.85
+      pt.dynamicLowRes = true
+      pt.minSamples = 3
+      return pt
+    })
+    step('setScene', () => pathTracer.setScene(scene, camera))
 
     const s = {
       renderer,
@@ -78,7 +143,6 @@ const PathTracerView = forwardRef(function PathTracerView(
       camera,
       controls,
       pathTracer,
-      pmrem,
       envTex,
       model: null,
       ceilingMesh: null,
@@ -133,7 +197,6 @@ const PathTracerView = forwardRef(function PathTracerView(
       controls.removeEventListener('change', onChange)
       controls.dispose()
       pathTracer.dispose?.()
-      pmrem.dispose()
       envTex.dispose()
       renderer.dispose()
       host.removeChild(renderer.domElement)
@@ -245,7 +308,9 @@ class PathTracerErrorBoundary extends Component {
     return { error }
   }
   componentDidCatch(error, info) {
-    console.error('PathTracerView crashed:', error, info)
+    console.error('PathTracerView crashed:', error)
+    console.error('PathTracerView error stack:', error?.stack)
+    console.error('PathTracerView component stack:', info?.componentStack)
   }
   render() {
     if (this.state.error) {
