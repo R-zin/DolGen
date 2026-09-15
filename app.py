@@ -30,6 +30,7 @@ Modal setup (secrets are intentionally NOT baked into this file):
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -46,6 +47,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from google import genai
 from google.genai import types as genai_types
+from openai import AsyncOpenAI
 from pydantic import BaseModel, field_validator
 
 try:  # precise error type when the installed google-genai exposes it
@@ -67,6 +69,7 @@ image = (
         "fastapi",
         "python-multipart",
         "google-genai",
+        "openai",
         # trimesh[all] covers the glTF stack; manifold3d lives in trimesh's *easy*
         # extra, not [all], so it must be pinned explicitly for boolean operations.
         "trimesh[all]",
@@ -75,6 +78,16 @@ image = (
         "networkx",
         "httpx",
         "pillow",  # crop floorplan + build texture images for AI furniture
+        # Open-weights furniture renderer (FLUX.1 Kontext [dev]) — torch/cuda
+        # come preinstalled on Modal's debian_slim GPU base, diffusers pulls
+        # the rest. Imported lazily inside the GPU class so the CPU web
+        # container never pays the import cost.
+        "torch",
+        "diffusers>=0.35.0",
+        "transformers",
+        "accelerate",
+        "sentencepiece",
+        "safetensors",
     )
 )
 
@@ -92,11 +105,36 @@ WALL_HEIGHT = 2.5          # meters
 WALL_THICKNESS = 0.15      # meters
 FLOOR_THICKNESS = 0.10     # meters (floor slab extends downward from z=0)
 
-GEMINI_MODEL = "gemini-3.8-flash"
+# Floorplan-extraction LLM: Kimi K3 (vision) served as an OpenAI-compatible
+# Modal proxy endpoint. The proxy authenticates with the workspace's
+# MODAL_PROXY_TOKEN_ID / MODAL_PROXY_TOKEN_SECRET joined by a dot.
+KIMI_BASE_URL = os.environ.get(
+    "KIMI_BASE_URL", "https://content-do--ep-kimi-k3-server.us-west.modal.direct/v1"
+)
+KIMI_MODEL = os.environ.get("KIMI_MODEL", "moonshotai/Kimi-K3")
+
+
+def _kimi_api_key() -> str:
+    """Modal proxy endpoints take '<token_id>.<token_secret>' as the API key."""
+    token_id = os.environ.get("MODAL_PROXY_TOKEN_ID", "wk-FdegwHxb4Ut1MxVa3YZsyr")
+    token_secret = os.environ.get("MODAL_PROXY_TOKEN_SECRET", "ws-5FcFsksBUoYtOgOxWPXCBy")
+    return f"{token_id}.{token_secret}"
 # Image model ("nano banana pro" / Gemini 3 Pro Image) used to render per-furniture
 # top-down views for AI-generated GLB textures. Overridable because Google renames
 # preview model IDs as they go stable.
 GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
+
+# Which backend renders AI furniture top-down views:
+#   "gemini"       (default) — Gemini image model, per-call pricing, no GPU
+#   "openweights"            — FLUX.1 Kontext [dev] on a Modal GPU container
+# Containers scale to zero when idle (scaledown_window=2s, the smallest Modal
+# accepts): every cold start pays the model-load time, nothing is paid idle.
+AI_IMAGE_BACKEND = os.environ.get("AI_IMAGE_BACKEND", "gemini").strip().lower()
+OPENWEIGHTS_MODEL = os.environ.get("OPENWEIGHTS_MODEL", "black-forest-labs/FLUX.1-Kontext-dev")
+# Volume caching the HF weights so cold starts after the first are seconds,
+# not a 30+ GB download. Created automatically on first deploy.
+WEIGHTS_VOLUME_NAME = os.environ.get("WEIGHTS_VOLUME_NAME", "dolgen-weights")
+WEIGHTS_DIR = "/weights"
 MAX_IMAGE_BYTES = 20 * 1024 * 1024          # 20 MB upload cap
 MAX_ASSET_BYTES = 64 * 1024 * 1024          # 64 MB per downloaded asset cap
 
@@ -152,7 +190,8 @@ class FloorElement(BaseModel):
 GEMINI_PROMPT = """You are an architectural floorplan understanding engine.
 
 Extract every structural element and every piece of furniture visible in this floorplan image,
-and return ONLY a JSON array matching the provided schema.
+and return ONLY a JSON object matching the provided schema: a top-level object with an
+"elements" array (and optionally "room_colors").
 
 Rules:
 - box_2d = [ymin, xmin, ymax, xmax] as integers normalized to 0-1000, where (0,0) is the
@@ -177,52 +216,71 @@ Rules:
   object mapping a short room name to a hex color string, e.g. {"bedroom": "#c8d6e8"}. If nothing
   is implied, omit it or return an empty object.
 - Ignore text labels, dimension lines, arrows, scale bars and north symbols.
+- Respond with a single JSON object only: {"elements": [...], "room_colors": {...}}. Wrap the
+  element array in the top-level "elements" key; "room_colors" may be omitted or empty.
 
 Be thorough: missing walls or furniture makes the 3D model wrong."""
 
 
 async def extract_elements(image_bytes: bytes, mime_type: str) -> list[FloorElement]:
-    """Call Gemini 2.5 Pro on the floorplan; return validated elements."""
+    """Call Kimi K3 (vision) on the floorplan; return validated elements."""
     try:
-        client = genai.Client()  # authenticates from the GEMINI_API_KEY env var (gemini-secret)
-    except Exception as exc:  # pragma: no cover - depends on runtime secrets
+        client = AsyncOpenAI(base_url=KIMI_BASE_URL, api_key=_kimi_api_key())
+    except Exception as exc:  # pragma: no cover - depends on runtime config
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Gemini client could not be created (is the 'gemini-secret' Modal secret "
-                f"with GEMINI_API_KEY configured?): {exc}"
-            ),
+            detail=f"Kimi client could not be created (KIMI_BASE_URL / proxy token): {exc}",
         )
 
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
     try:
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                GEMINI_PROMPT,
+        completion = await client.chat.completions.create(
+            model=KIMI_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{b64_image}"},
+                        },
+                        {"type": "text", "text": GEMINI_PROMPT},
+                    ],
+                }
             ],
-            config=genai_types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-                response_schema=list[FloorElement],
-            ),
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            # Kimi K3 always reasons (it cannot disable thinking); "low" is the
+            # cheapest setting the endpoint accepts.
+            extra_body={"reasoning_effort": "low"},
         )
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Gemini analysis failed: {exc}")
+        raise HTTPException(status_code=422, detail=f"Kimi analysis failed: {exc}")
 
-    parsed = response.parsed
-    if parsed is None and getattr(response, "text", None):
-        # Fallback: validate the raw JSON text ourselves.
+    text = (completion.choices[0].message.content or "").strip() if completion.choices else ""
+    elements: list[Any] = []
+    if text:
         try:
-            parsed = [FloorElement.model_validate(o) for o in json.loads(response.text)]
+            obj = json.loads(text)
+            # JSON mode returns an object; the element array lives under "elements".
+            if isinstance(obj, dict):
+                obj = obj.get("elements", [])
+            if isinstance(obj, list):
+                elements = obj
+        except (json.JSONDecodeError, AttributeError):
+            elements = []
+    parsed = []
+    for o in elements:
+        try:
+            parsed.append(FloorElement.model_validate(o))
         except Exception:
-            parsed = None
+            continue
     if not parsed:
         raise HTTPException(
             status_code=422,
-            detail="Gemini returned no extractable elements for this floorplan image.",
+            detail="Kimi returned no extractable elements for this floorplan image.",
         )
-    return list(parsed)
+    return parsed
 
 
 def normalize_elements(parsed: list[FloorElement]) -> list[dict[str, Any]]:
@@ -377,30 +435,55 @@ def build_shell(
         return scale_mesh(new_box, 0.0, WALL_HEIGHT)
 
     def opening_cutters_through(wall_mesh: trimesh.Trimesh, op: dict[str, Any], kind: str) -> Optional[trimesh.Trimesh]:
-        """Build a cutter for a door/window that is guaranteed to span the wall's
-        thin axis (so the boolean produces a real through-hole even if the 2D boxes
-        of the wall and opening don't perfectly overlap)."""
+        """Build a cutter for a door/window through THIS wall.
+
+        The opening only cuts this wall if its 2D footprint actually sits on the
+        wall: the two must overlap along the wall's long axis, and the opening's
+        center must lie on (within a tolerance of) the wall's thin axis. Without
+        this gate every window/door in the plan was punching a hole through every
+        wall it geometrically crossed — e.g. a window on the north wall also
+        blowing a full-height gap through the parallel south wall.
+        """
         oymin, oxmin, oymax, oxmax = op["box_2d"]
         wall_ext = wall_mesh.extents          # meters
         thin_axis = 0 if wall_ext[0] < wall_ext[1] else 1
         long_axis = 1 - thin_axis
         z_min, z_max = opening_hparams(op["box_2d"], kind)
 
-        # Hole width: the opening's real extent along the wall's LONG axis, in meters.
-        if long_axis == 0:
-            op_long_lo, op_long_hi = oxmin * SCALE, oxmax * SCALE
-        else:
-            op_long_lo, op_long_hi = -oymax * SCALE, -oymin * SCALE
-        if op_long_hi - op_long_lo <= 1e-3:
-            return None
+        # The opening's 2D box as a physical rectangle (matching scale_mesh's y-flip).
+        op_x_lo, op_x_hi = oxmin * SCALE, oxmax * SCALE
+        op_y_lo, op_y_hi = -oymax * SCALE, -oymin * SCALE
+        op_lo = (op_x_lo, op_y_lo)
+        op_hi = (op_x_hi, op_y_hi)
+
+        # 1) Long-axis overlap: the opening must share a real span with this wall.
+        w_long_lo = wall_mesh.bounds[0, long_axis]
+        w_long_hi = wall_mesh.bounds[1, long_axis]
+        ov_lo = max(op_lo[long_axis], w_long_lo)
+        ov_hi = min(op_hi[long_axis], w_long_hi)
+        if ov_hi - ov_lo <= 1e-3:
+            return None  # opening doesn't reach this wall along its length
+
+        # 2) Thin-axis proximity: the opening's center must sit on the wall.
+        #    Tolerance = wall half-thickness + a little slack for a loosely drawn box.
+        w_thin_lo = wall_mesh.bounds[0, thin_axis]
+        w_thin_hi = wall_mesh.bounds[1, thin_axis]
+        op_thin_mid = (op_lo[thin_axis] + op_hi[thin_axis]) / 2
+        thin_slack = (w_thin_hi - w_thin_lo) / 2 + 0.35  # ~wall half-thickness + 0.35 m
+        if not (w_thin_lo - thin_slack) <= op_thin_mid <= (w_thin_hi + thin_slack):
+            return None  # opening is on a different (e.g. parallel) wall
+
+        # Hole width: clamp the opening's long-axis span to the wall segment so a
+        # box drawn wider than the wall can't over-cut into the room.
+        op_long_lo, op_long_hi = ov_lo, ov_hi
 
         # Cutter thin span = wall thin span + margin, so it passes fully through.
         margin = 0.05
         lo = [0.0, 0.0, z_min]
         hi = [0.0, 0.0, z_max]
         lo[long_axis], hi[long_axis] = op_long_lo, op_long_hi
-        lo[thin_axis] = wall_mesh.bounds[0, thin_axis] - margin
-        hi[thin_axis] = wall_mesh.bounds[1, thin_axis] + margin
+        lo[thin_axis] = w_thin_lo - margin
+        hi[thin_axis] = w_thin_hi + margin
         extents = (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
         if min(extents) <= 1e-4:
             return None
@@ -561,6 +644,79 @@ async def download_assets(
 # yields None and the caller falls back to the untextured procedural mesh.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Open-weights furniture renderer (FLUX.1 Kontext [dev] on Modal GPU)
+#
+# Active only when AI_IMAGE_BACKEND=openweights. The class holds the pipeline
+# in a GPU container; containers scale to zero when idle (scaledown_window=0)
+# so nothing is paid while unused — the cost is that every cold start pays
+# the model-load time (seconds once WEIGHTS_DIR is warm, minutes on the very
+# first pull). Every render failure returns None and the caller falls back to
+# the Gemini image model, then to a procedural mesh, per the usual layering.
+# ---------------------------------------------------------------------------
+
+OPENWEIGHTS_PROMPT = """Turn this 2D architectural floorplan symbol (a {furniture_class}) into a
+photorealistic, perfectly top-down (orthographic plan view) product photo of the real 3D piece.
+Camera directly overhead, looking straight down. Keep the piece's orientation in the frame
+exactly as drawn. Center it, filling most of the frame with a small even margin. Pure solid
+white background (#ffffff), soft even studio lighting, subtle contact shadow. No text, labels,
+dimension lines, borders, floor lines, or other objects.{style_hint}"""
+
+
+@app.cls(
+    image=image,
+    gpu="L40S",
+    volumes={WEIGHTS_DIR: modal.Volume.from_name(WEIGHTS_VOLUME_NAME, create_if_missing=True)},
+    secrets=[modal.Secret.from_name("gemini-secret")],  # HF_TOKEN can live here if the repo is gated
+    scaledown_window=2,      # cold-only: scale to zero right after each call (Modal min is 2s)
+    timeout=900,             # generous for first-ever weights download
+    memory=32768,
+)
+class FurnitureRenderer:
+    """Holds a loaded FLUX.1 Kontext pipeline for the lifetime of one warm container."""
+
+    @modal.enter()
+    def load_pipeline(self) -> None:
+        import torch
+        from diffusers import FluxKontextPipeline
+
+        logger.info("Loading %s onto GPU (cold start)...", OPENWEIGHTS_MODEL)
+        self.pipe = FluxKontextPipeline.from_pretrained(
+            OPENWEIGHTS_MODEL,
+            torch_dtype=torch.bfloat16,
+            cache_dir=WEIGHTS_DIR,
+        )
+        self.pipe.to("cuda")
+        logger.info("Furniture renderer ready.")
+
+    @modal.method()
+    def render(self, crop_png: bytes, furniture_class: str, style_hint: str) -> bytes | None:
+        """One top-down product render of the furniture piece, as PNG bytes."""
+        import io as _io
+
+        from PIL import Image
+
+        try:
+            init_image = Image.open(_io.BytesIO(crop_png)).convert("RGB")
+            prompt = OPENWEIGHTS_PROMPT.format(
+                furniture_class=furniture_class or "furniture",
+                style_hint=f"\nFor reference, the piece looks like: {style_hint}." if style_hint else "",
+            )
+            out = self.pipe(
+                image=init_image,
+                prompt=prompt,
+                guidance_scale=2.5,
+                num_inference_steps=28,
+            )
+            img = out.images[0]
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as exc:
+            logger.info("Open-weights render failed for '%s': %s", furniture_class, exc)
+            return None
+
+
 AI_FURNITURE_PROMPT = """You are given a crop of a 2D architectural floorplan showing one piece of furniture
 (a {furniture_class}).
 
@@ -647,10 +803,41 @@ def _crop_pad_floorplan(
     return buf.getvalue()
 
 
+async def _gen_furniture_view_openweights(crop_png: bytes, el: dict[str, Any]) -> bytes | None:
+    """Render via the GPU-resident FLUX.1 Kontext pipeline. None on any failure
+    (the caller then tries Gemini, then a procedural mesh)."""
+    try:
+        renderer = FurnitureRenderer()
+        return await renderer.render.remote.aio(
+            crop_png,
+            el.get("furniture_class") or "furniture",
+            el.get("asset_search_query") or "",
+        )
+    except Exception as exc:
+        logger.info("Open-weights backend unavailable: %s", exc)
+        return None
+
+
 async def _gen_furniture_view(
     client: genai.Client, crop_png: bytes, el: dict[str, Any]
 ) -> bytes | None:
-    """One Gemini image-model render of the furniture piece (top-down view)."""
+    """One render of the furniture piece (top-down view).
+
+    Backend chosen by AI_IMAGE_BACKEND: "openweights" tries the GPU pipeline
+    first and falls back to the Gemini image model on failure; "gemini" (the
+    default) goes straight to the Gemini image model.
+    """
+    if AI_IMAGE_BACKEND == "openweights":
+        data = await _gen_furniture_view_openweights(crop_png, el)
+        if data is not None:
+            return data
+        logger.info(
+            "Falling back to Gemini image model for '%s'.",
+            el.get("furniture_class") or "furniture",
+        )
+    elif AI_IMAGE_BACKEND != "gemini":
+        logger.warning("Unknown AI_IMAGE_BACKEND '%s' — using gemini.", AI_IMAGE_BACKEND)
+
     prompt = AI_FURNITURE_PROMPT.format(
         furniture_class=el.get("furniture_class") or "furniture"
     )
