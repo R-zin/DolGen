@@ -1,18 +1,24 @@
 """
 DolGen — turn a 2D floorplan image into a path-traced 3D dollhouse.
 
+Structure only: the pipeline reconstructs the architectural shell of the house —
+walls, door/window openings, floor (and optional ceiling). Furniture is
+deliberately discarded so the extraction model can spend all of its attention
+on the structure.
+
 Pipeline (per POST /generate-3d request):
-  1. Gemini 2.5 Pro (temperature=0.0, strict JSON schema) extracts walls / doors /
-     windows / furniture as 2D boxes normalized to a 0-1000 image coordinate system.
-  2. Furniture elements are resolved to .glb models. In "auto" mode each piece
-     first tries a Sketchfab-compatible asset API, then falls back to an
-     AI-generated model: the furniture's footprint is cropped from the floorplan,
-     Gemini 3 Pro Image ("nano banana pro") renders it as a clean top-down
-     product image, and that image is texture-mapped onto a procedural mesh and
-     exported as a .glb. Any failure falls back to an untextured procedural mesh.
+  1. OpenCV preprocessing normalizes the upload: EXIF orientation, upscale to
+     ~2048 px, denoise, and white-balance/normalize the background (gray-world
+     white balance + CLAHE contrast). The result is a binary wall mask: thick
+     dark partitions (walls) become black lines on white, and small dark
+     components inside rooms (hatching, furniture strokes, symbols) are
+     removed — so the vision model sees clean structure only. On any failure
+     the original bytes are used instead.
+  2. Kimi K3 (Moonshot AI vision model, OpenAI-compatible endpoint on Modal,
+     temperature=0.0, JSON-mode) extracts walls / doors / windows as 2D boxes
+     normalized to a 0-1000 image coordinate system.
   3. Trimesh assembles the dollhouse: 2.5 m walls, boolean-cut door/window
-     openings, PBR materials (white walls, light-wood floor), furniture scaled
-     and placed inside its 2D footprint.
+     openings, PBR materials (white walls, light-wood floor).
   4. The merged scene is exported as binary GLTF (.glb) and streamed back with
      media type 'model/gltf-binary'.
 
@@ -21,37 +27,29 @@ frontend is the React app in frontend/ (Vite) which renders the GLB with
 three-gpu-pathtracer (progressive path tracing + ACES filmic tone mapping).
 
 Modal setup (secrets are intentionally NOT baked into this file):
-  modal secret create gemini-secret GEMINI_API_KEY=...
-  modal secret create asset-api-secret ASSET_API_TOKEN=...   # optional ASSET_BASE_URL=...
+  modal secret create kimi-verify KIMI_BASE_URL=...   # plus KIMI_TOKEN_ID/KIMI_TOKEN_SECRET,
+                                                      # or rely on the workspace MODAL_TOKEN_*
   modal serve app.py      # hot-reload playground URL
   modal deploy app.py     # persistent deployment
 """
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
+import base64
 import io
 import json
 import logging
 import os
 from typing import Any, Literal, Optional
 
-import httpx
 import modal
 import numpy as np
 import trimesh
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
-from google import genai
-from google.genai import types as genai_types
+from openai import AsyncOpenAI
 from pydantic import BaseModel, field_validator
-
-try:  # precise error type when the installed google-genai exposes it
-    from google.genai.errors import ClientError as GenAIClientError
-except Exception:  # pragma: no cover - older SDKs
-    GenAIClientError = None  # type: ignore[assignment]
 
 logger = logging.getLogger("dolgen")
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -66,15 +64,15 @@ image = (
     .pip_install(
         "fastapi",
         "python-multipart",
-        "google-genai",
+        "openai",  # Kimi K3 is served over an OpenAI-compatible endpoint
         # trimesh[all] covers the glTF stack; manifold3d lives in trimesh's *easy*
         # extra, not [all], so it must be pinned explicitly for boolean operations.
         "trimesh[all]",
         "manifold3d>=2.3.0",
         "scipy",
         "networkx",
-        "httpx",
-        "pillow",  # crop floorplan + build texture images for AI furniture
+        "pillow",  # decode uploads before OpenCV preprocessing
+        "opencv-python-headless",  # floorplan preprocessing (normalization + wall mask)
     )
 )
 
@@ -92,13 +90,20 @@ WALL_HEIGHT = 2.5          # meters
 WALL_THICKNESS = 0.15      # meters
 FLOOR_THICKNESS = 0.10     # meters (floor slab extends downward from z=0)
 
-GEMINI_MODEL = "gemini-3.8-flash"
-# Image model ("nano banana pro" / Gemini 3 Pro Image) used to render per-furniture
-# top-down views for AI-generated GLB textures. Overridable because Google renames
-# preview model IDs as they go stable.
-GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
+# Kimi K3 (Moonshot AI), self-hosted on Modal behind an OpenAI-compatible
+# endpoint. There is no public URL — KIMI_BASE_URL must point at YOUR deployed
+# endpoint (e.g. https://<workspace>--kimi-k3-serve.modal.run/v1). The endpoint
+# authenticates with a token id + token secret pair.
+#
+# Credentials come from the "kimi-verify" Modal secret, which supplies
+# KIMI_BASE_URL (and optionally KIMI_MODEL / KIMI_TIMEOUT_S). The token pair is
+# read from KIMI_TOKEN_ID / KIMI_TOKEN_SECRET if present, falling back to the
+# Modal workspace tokens MODAL_TOKEN_ID / MODAL_TOKEN_SECRET (what a Modal-
+# hosted endpoint typically expects).
+KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k3")
+KIMI_BASE_URL = os.environ.get("KIMI_BASE_URL", "")
+KIMI_TIMEOUT_S = float(os.environ.get("KIMI_TIMEOUT_S", "120"))
 MAX_IMAGE_BYTES = 20 * 1024 * 1024          # 20 MB upload cap
-MAX_ASSET_BYTES = 64 * 1024 * 1024          # 64 MB per downloaded asset cap
 
 # Cross-origin access for the React dev server / any deployed static frontend.
 # The Vite dev server proxies /generate-3d, so this is mainly for direct calls.
@@ -110,35 +115,115 @@ ALLOWED_ORIGINS = [
     if o.strip()
 ]
 
-ASSET_BASE_URL = os.environ.get("ASSET_BASE_URL", "https://api.sketchfab.com/v3")
-ASSET_API_TOKEN = os.environ.get("ASSET_API_TOKEN")
-# How many downloadable search candidates to try per furniture piece before
-# falling back to a procedural mesh — makes "matches the extraction" far more
-# likely than the old single top-hit.
-ASSET_TOP_K = int(os.environ.get("ASSET_TOP_K", "3"))
+# ---------------------------------------------------------------------------
+# Floorplan preprocessing (OpenCV)
+#
+# The vision model is far more accurate on a clean structural drawing than on a raw
+# scan/photo of a colored floorplan. Before extraction we:
+#   1. honor EXIF orientation and upscale small images to ~2048 px,
+#   2. denoise and normalize the background (gray-world white balance +
+#      CLAHE contrast), so colored scans and photos behave like white plans,
+#   3. build a binary *wall mask*: adaptive threshold -> morphology ->
+#      small-connected-component removal. Thick dark partitions survive as
+#      black lines on white; furniture strokes, hatching, and symbols inside
+#      rooms (small dark components) are discarded.
+# Any failure anywhere falls back to the raw upload bytes.
+# ---------------------------------------------------------------------------
 
-# Downloaded GLBs are cached by search query so repeat runs skip the network.
-# A Modal volume named "dolgen-assets" is mounted here when it exists; locally
-# (or if the volume is absent) this just falls back to a tmp dir.
-ASSET_CACHE_DIR = os.environ.get("ASSET_CACHE_DIR", "/cache/assets")
-try:
-    os.makedirs(ASSET_CACHE_DIR, exist_ok=True)
-except OSError:  # read-only / nonexistent mount (e.g. local run) — use tmp
-    ASSET_CACHE_DIR = os.path.join("/tmp", "dolgen-assets")
-    os.makedirs(ASSET_CACHE_DIR, exist_ok=True)
+# Minimum surviving dark-component size, as a fraction of the image area.
+# Real wall partitions are long thick runs (~0.05%+ of the image); furniture
+# strokes / symbols / hatching are far smaller.
+_WALL_MASK_MIN_AREA_FRAC = 5e-4
+
+
+def _bytes_to_bgr(image_bytes: bytes) -> Optional[Any]:
+    """Decode image bytes to a BGR array, honoring EXIF orientation."""
+    import cv2
+    from PIL import Image, ImageOps
+
+    try:  # PIL first: applies EXIF rotation that cv2.imdecode ignores
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+        return cv2.cvtColor(np.asarray(im), cv2.COLOR_RGB2BGR)
+    except Exception:
+        pass
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def _normalize_floorplan(bgr: Any, long_side: int = 2048) -> Any:
+    """Denoise + white-balance + contrast-normalize a floorplan scan/photo."""
+    import cv2
+
+    h, w = bgr.shape[:2]
+    scale = long_side / max(h, w)
+    if scale > 1.0:
+        bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # Gray-world white balance: pull colored casts (sepia scans, tinted fills)
+    # toward neutral before the heavy normalization.
+    means = bgr.reshape(-1, 3).mean(axis=0)
+    bgr = np.clip(bgr.astype(np.float32) * (means.mean() / np.maximum(means, 1e-6)), 0, 255).astype(np.uint8)
+
+    denoised = cv2.fastNlMeansDenoisingColored(bgr, None, 5, 5, 7, 21)
+    gray = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
+def build_wall_mask(gray: Any) -> Any:
+    """Binary wall mask: walls black (0) on white (255); interior clutter removed.
+
+    Otsu on an aggressively blurred image finds the ink/background split even on
+    colored plans; an opening pass drops thin strokes, then small dark
+    components (furniture, symbols, hatching) are discarded so only the thick
+    structural partitions remain.
+    """
+    import cv2
+
+    h, w = gray.shape[:2]
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, ink = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    k = max(2, int(round(min(h, w) / 400)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    opened = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    min_area = max(24, int(_WALL_MASK_MIN_AREA_FRAC * h * w))
+    n, _labels, stats, _centroids = cv2.connectedComponentsWithStats(opened, connectivity=8)
+    walls = np.zeros_like(ink)
+    for i in range(1, n):  # label 0 is the background
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            walls[_labels == i] = 255
+    return cv2.bitwise_not(walls)  # walls black on white
+
+
+def preprocess_floorplan(image_bytes: bytes) -> tuple[bytes, str]:
+    """Normalize the upload and return (png_bytes, 'image/png').
+
+    Falls back to the original bytes and mime type when decoding fails.
+    """
+    bgr = _bytes_to_bgr(image_bytes)
+    if bgr is None:
+        return image_bytes, ""
+    import cv2
+
+    normalized = _normalize_floorplan(bgr)
+    mask = build_wall_mask(normalized)
+    ok, buf = cv2.imencode(".png", mask)
+    if not ok:
+        return image_bytes, ""
+    return buf.tobytes(), "image/png"
 
 
 # ---------------------------------------------------------------------------
-# Gemini extraction schema
+# Kimi extraction schema
 # ---------------------------------------------------------------------------
 
 class FloorElement(BaseModel):
-    """One extracted floorplan element. box_2d is [ymin, xmin, ymax, xmax]
+    """One extracted structural element. box_2d is [ymin, xmin, ymax, xmax]
     on a 0-1000 normalized image coordinate system ((0,0) = top-left)."""
 
-    element_type: Literal["wall", "door", "window", "furniture"]
-    furniture_class: Optional[str] = None            # e.g. "bed", "sofa"; null if not furniture
-    asset_search_query: Optional[str] = None         # 3-5 word 3D-asset query; null if not furniture
+    element_type: Literal["wall", "door", "window"]
     box_2d: list[float]                              # kept float here; rounded/clamped downstream
 
     @field_validator("box_2d")
@@ -149,80 +234,147 @@ class FloorElement(BaseModel):
         return v
 
 
-GEMINI_PROMPT = """You are an architectural floorplan understanding engine.
+KIMI_PROMPT = """You are an architectural floorplan understanding engine.
 
-Extract every structural element and every piece of furniture visible in this floorplan image,
-and return ONLY a JSON array matching the provided schema.
+The image is a preprocessed binary wall mask of a floorplan: structural walls are thick BLACK
+lines on a WHITE background. Furniture and interior clutter have already been removed.
+
+Extract every STRUCTURAL element of the house — walls, doors, windows — and return ONLY a
+JSON array matching the provided schema. Focus exclusively on the structure of the building.
 
 Rules:
 - box_2d = [ymin, xmin, ymax, xmax] as integers normalized to 0-1000, where (0,0) is the
   TOP-LEFT of the image. Boxes must be axis-aligned and tight around the element.
 - element_type "wall": every solid wall segment (exterior and interior). Represent each straight
   wall segment as its own thin box. Walls should join to form closed rooms where possible.
-- element_type "door": every door opening through a wall; the box covers the opening rectangle.
-- element_type "window": every window opening through a wall; the box covers the opening rectangle.
-- element_type "furniture": movable objects only (bed, sofa, table, chair, desk, wardrobe, bathtub,
-  toilet, sink, stove, fridge, ...). The box is the object's top-down floor footprint. Also set:
-    * furniture_class      -> a short lower-case class name, e.g. "bed", "sofa", "dining_table"
-    * asset_search_query   -> a specific natural-language search query (type + material + color +
-                              style) that would find a good 3D model of THIS object in a 3D asset
-                              library, e.g. "modern grey fabric sectional sofa", "oak queen bed frame",
-                              "white ceramic pedestal sink"
-- asset_search_query should describe the SPECIFIC object, not a generic category: include
-  type + material + color + style, e.g. "modern grey fabric sectional sofa", "oak queen bed frame",
-  "white ceramic pedestal sink". This query is used verbatim to fetch a matching 3D model from
-  a web asset library, so make it visually faithful to what is drawn.
-- furniture_class and asset_search_query MUST be null when element_type is not "furniture".
-- If a room's fill color or a clear label implies a wall/room color, add a top-level "room_colors"
-  object mapping a short room name to a hex color string, e.g. {"bedroom": "#c8d6e8"}. If nothing
-  is implied, omit it or return an empty object.
-- Ignore text labels, dimension lines, arrows, scale bars and north symbols.
+- element_type "door": every door opening through a wall (a gap in the black wall stroke,
+  possibly with a swing arc). The box covers the opening rectangle within the wall.
+- element_type "window": every window opening through a wall (a break in an exterior wall,
+  often marked by parallel thin lines). The box covers the opening rectangle within the wall.
+- The outer boundary of the black walls is the building footprint — trace it exactly.
+- Do NOT invent rooms, floors, or walls that are not visible. Do NOT report furniture,
+  fixtures, text labels, dimension lines, arrows, scale bars or north symbols.
+- If a wall segment is ambiguous, prefer continuity: walls that clearly meet should be
+  reported as segments that join.
 
-Be thorough: missing walls or furniture makes the 3D model wrong."""
+Be thorough and precise: missing or misplaced walls make the 3D model wrong."""
 
 
-async def extract_elements(image_bytes: bytes, mime_type: str) -> list[FloorElement]:
-    """Call Gemini 2.5 Pro on the floorplan; return validated elements."""
-    try:
-        client = genai.Client()  # authenticates from the GEMINI_API_KEY env var (gemini-secret)
-    except Exception as exc:  # pragma: no cover - depends on runtime secrets
+def _kimi_client() -> AsyncOpenAI:
+    """Build an OpenAI-compatible client for the Kimi K3 endpoint on Modal.
+
+    The token pair is KIMI_TOKEN_ID / KIMI_TOKEN_SECRET when set, otherwise the
+    Modal workspace tokens MODAL_TOKEN_ID / MODAL_TOKEN_SECRET (what a Modal-
+    hosted endpoint typically expects). KIMI_BASE_URL points at the endpoint.
+    """
+    token_id = os.environ.get("KIMI_TOKEN_ID") or os.environ.get("MODAL_TOKEN_ID", "")
+    token_secret = os.environ.get("KIMI_TOKEN_SECRET") or os.environ.get("MODAL_TOKEN_SECRET", "")
+    if not (KIMI_BASE_URL and token_id and token_secret):
         raise HTTPException(
             status_code=500,
             detail=(
-                "Gemini client could not be created (is the 'gemini-secret' Modal secret "
-                f"with GEMINI_API_KEY configured?): {exc}"
+                "Kimi endpoint is not configured — the 'kimi-verify' Modal secret must "
+                "set KIMI_BASE_URL, plus KIMI_TOKEN_ID/KIMI_TOKEN_SECRET (or rely on the "
+                "MODAL_TOKEN_ID/MODAL_TOKEN_SECRET workspace tokens)."
             ),
         )
+    return AsyncOpenAI(
+        base_url=KIMI_BASE_URL,
+        api_key=f"{token_id}:{token_secret}",
+        timeout=KIMI_TIMEOUT_S,
+        max_retries=1,
+    )
 
+
+def _elements_json_schema() -> dict[str, Any]:
+    """JSON schema for the extraction response (a raw array of FloorElement)."""
+    schema = FloorElement.model_json_schema()
+    schema.pop("title", None)
+    return {
+        "name": "floorplan_elements",
+        "strict": True,
+        "schema": {
+            "type": "array",
+            "items": schema,
+        },
+    }
+
+
+def _parse_elements_text(text: Optional[str]) -> list[FloorElement]:
+    """Parse the model's JSON text into validated FloorElements.
+
+    Handles a raw array, an object wrapping the array, and ```json fences.
+    """
+    if not text:
+        return []
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s[:4].lower() == "json":
+            s = s[4:]
+        s = s.strip()
     try:
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                GEMINI_PROMPT,
-            ],
-            config=genai_types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-                response_schema=list[FloorElement],
-            ),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Gemini analysis failed: {exc}")
-
-    parsed = response.parsed
-    if parsed is None and getattr(response, "text", None):
-        # Fallback: validate the raw JSON text ourselves.
+        obj = json.loads(s)
+    except ValueError:
+        return []
+    if isinstance(obj, dict):  # tolerate a wrapper like {"elements": [...]}
+        obj = next((v for v in obj.values() if isinstance(v, list)), [])
+    if not isinstance(obj, list):
+        return []
+    out: list[FloorElement] = []
+    for item in obj:
         try:
-            parsed = [FloorElement.model_validate(o) for o in json.loads(response.text)]
+            out.append(FloorElement.model_validate(item))
         except Exception:
-            parsed = None
+            continue
+    return out
+
+
+async def extract_elements(image_bytes: bytes, mime_type: str) -> list[FloorElement]:
+    """Call Kimi K3 on the (preprocessed) floorplan; return validated elements."""
+    client = _kimi_client()
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    kwargs: dict[str, Any] = {
+        "model": KIMI_MODEL,
+        "temperature": 0.0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+                    },
+                    {"type": "text", "text": KIMI_PROMPT},
+                ],
+            }
+        ],
+    }
+    # JSON mode: prefer strict schema; fall back to plain JSON-object mode, then
+    # to no constraint, so the call works across OpenAI-compatible servers.
+    try:
+        response = await client.chat.completions.create(
+            **kwargs, response_format={"type": "json_schema", "json_schema": _elements_json_schema()}
+        )
+    except Exception:
+        try:
+            response = await client.chat.completions.create(
+                **kwargs, response_format={"type": "json_object"}
+            )
+        except Exception:
+            try:
+                response = await client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"Kimi analysis failed: {exc}")
+
+    text = response.choices[0].message.content if response.choices else None
+    parsed = _parse_elements_text(text)
     if not parsed:
         raise HTTPException(
             status_code=422,
-            detail="Gemini returned no extractable elements for this floorplan image.",
+            detail="Kimi returned no extractable elements for this floorplan image.",
         )
-    return list(parsed)
+    return parsed
 
 
 def normalize_elements(parsed: list[FloorElement]) -> list[dict[str, Any]]:
@@ -239,8 +391,6 @@ def normalize_elements(parsed: list[FloorElement]) -> list[dict[str, Any]]:
         out.append(
             {
                 "element_type": el.element_type,
-                "furniture_class": el.furniture_class,
-                "asset_search_query": el.asset_search_query,
                 "box_2d": box,
             }
         )
@@ -257,7 +407,7 @@ def normalize_elements(parsed: list[FloorElement]) -> list[dict[str, Any]]:
 #               z_m = 0 (floor) .. +WALL_HEIGHT
 #
 # Every mesh in the scene is built by scale_mesh() from an image-space box plus
-# (z_min, z_max) — walls, floor, door/window cutter blocks and furniture
+# (z_min, z_max) — walls, floor, and door/window cutter blocks
 # placement footprints all share this exact transform, so nothing drifts.
 # ---------------------------------------------------------------------------
 
@@ -274,11 +424,6 @@ def scale_mesh(box: list[int], z_min: float, z_max: float) -> trimesh.Trimesh:
     )
     mesh.apply_translation(((x_lo + x_hi) / 2, (y_lo + y_hi) / 2, (z_min + z_max) / 2))
     return mesh
-
-
-def box_center_xy_meters(box: list[int]) -> tuple[float, float]:
-    ymin, xmin, ymax, xmax = box
-    return ((xmin + xmax) / 2 * SCALE, -(ymin + ymax) / 2 * SCALE)
 
 
 def opening_hparams(box: list[int], kind: str) -> tuple[float, float]:
@@ -358,7 +503,7 @@ def build_shell(
     def wall_mesh_from_box(box: list[int]) -> trimesh.Trimesh:
         """Build a wall of *exactly* WALL_THICKNESS, centered on the box's thin axis.
 
-        Walls returned by Gemini are often fatter than real walls (it outlines the
+        Walls returned by the vision model are often fatter than real walls (it outlines the
         whole stroke). We keep the box's long-axis extent but force the thin axis to
         WALL_THICKNESS so rooms stay the right size and the enclosing scale holds.
         """
@@ -427,565 +572,6 @@ def build_shell(
     return scene, logs
 
 
-# ---------------------------------------------------------------------------
-# Dynamic asset fetching (Sketchfab-compatible) — graceful skip on any failure
-# ---------------------------------------------------------------------------
-
-def _cache_key(query: str) -> str:
-    return hashlib.sha256(query.strip().lower().encode("utf-8")).hexdigest()[:24] + ".glb"
-
-
-def _looks_like_glb(data: bytes) -> bool:
-    return len(data) >= 12 and data[:4] == b"glTF"
-
-
-def _glb_parses(data: bytes) -> bool:
-    """Cheap validity gate: a candidate only 'matches' if trimesh can load it
-    and it has real geometry — otherwise we keep looking."""
-    try:
-        mesh = _as_one_mesh(trimesh.load(io.BytesIO(data), file_type="glb", force="mesh", process=False))
-        return bool(np.all(np.isfinite(mesh.extents)) and mesh.extents.max() > 1e-5)
-    except Exception:
-        return False
-
-
-async def _fetch_one_asset(
-    client: httpx.AsyncClient, query: str
-) -> tuple[Optional[bytes], str]:
-    """Fetch a furniture asset from the web asset library that *matches* `query`.
-
-    Instead of taking the first search hit, walk the top-`ASSET_TOP_K`
-    downloadable candidates and return the first whose .glb both downloads and
-    actually parses — so the placed model is far more likely to resemble what
-    Gemini extracted. Results are cached on disk keyed by query.
-    """
-    key = _cache_key(query)
-    cached = os.path.join(ASSET_CACHE_DIR, key)
-    if os.path.exists(cached):
-        try:
-            with open(cached, "rb") as fh:
-                return fh.read(), "cache"
-        except OSError:
-            pass  # fall through to the network
-
-    headers = {"Authorization": f"Bearer {ASSET_API_TOKEN}"} if ASSET_API_TOKEN else {}
-    try:
-        search = await client.get(
-            f"{ASSET_BASE_URL}/search",
-            params={"type": "models", "q": query, "downloadable": "true", "count": str(ASSET_TOP_K)},
-            headers=headers,
-        )
-        search.raise_for_status()
-        results = (search.json().get("results") or [])[: max(ASSET_TOP_K, 1)]
-        if not results:
-            return None, f"no downloadable results for '{query}'"
-
-        last_err = "no usable candidate"
-        for hit in results:
-            uid = hit.get("uid") if isinstance(hit, dict) else None
-            if not uid:
-                continue
-            try:
-                dl = await client.post(f"{ASSET_BASE_URL}/models/{uid}/download", headers=headers)
-                dl.raise_for_status()
-                payload = dl.json()
-                fmt = payload.get("glb") or payload.get("gltf") or {}
-                url = fmt.get("url") if isinstance(fmt, dict) else None
-                if not isinstance(fmt, dict) or not url:
-                    url = None
-                    for entry in payload if isinstance(payload, list) else [payload]:
-                        if isinstance(entry, dict) and entry.get("url"):
-                            url = entry["url"]
-                            break
-                if not url:
-                    last_err = "no direct .glb/.gltf url in download response"
-                    continue
-
-                resp = await client.get(url, headers=headers, follow_redirects=True)
-                resp.raise_for_status()
-                data = resp.content
-                if len(data) > MAX_ASSET_BYTES:
-                    last_err = f"asset too large ({len(data)} bytes)"
-                    continue
-                if _looks_like_glb(data) and _glb_parses(data):
-                    try:
-                        with open(cached, "wb") as fh:
-                            fh.write(data)
-                    except OSError:
-                        pass
-                    return data, "ok"
-                last_err = "candidate was not a loadable GLB"
-            except httpx.HTTPStatusError as exc:
-                last_err = f"download HTTP {exc.response.status_code}"
-            except Exception as exc:  # keep trying the next candidate
-                last_err = f"{type(exc).__name__}: {exc}"
-        return None, f"all {len(results)} candidates failed ({last_err})"
-    except httpx.HTTPStatusError as exc:
-        return None, f"asset API HTTP {exc.response.status_code}"
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
-
-
-async def download_assets(
-    elements: list[dict[str, Any]],
-) -> tuple[list[tuple[dict[str, Any], bytes]], list[str]]:
-    """Download every furniture element's asset concurrently. Skips failures."""
-    furniture = [e for e in elements if e["element_type"] == "furniture" and e["asset_search_query"]]
-    logs: list[str] = [f"Fetching {len(furniture)} furniture assets from {ASSET_BASE_URL}..."]
-    ok: list[tuple[dict[str, Any], bytes]] = []
-    if not furniture:
-        return ok, logs
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        results = await asyncio.gather(
-            *( _fetch_one_asset(client, e["asset_search_query"]) for e in furniture )
-        )
-    for el, (data, status) in zip(furniture, results):
-        name = el.get("furniture_class") or el["asset_search_query"]
-        if data is None:
-            logs.append(f"Asset download failed for '{name}' ({status}) — skipping furniture.")
-        else:
-            logs.append(f"Downloaded asset for '{name}' ({len(data)//1024} KB).")
-            ok.append((el, data))
-    return ok, logs
-
-
-# ---------------------------------------------------------------------------
-# AI-generated furniture models (Gemini image model "nano banana pro")
-#
-# For each furniture piece we crop its footprint out of the uploaded floorplan,
-# ask the Gemini image model to render that piece as a clean top-down product
-# photo, texture-map the image onto a procedural mesh of the piece, and export
-# it as a self-contained .glb — which then flows through the exact same
-# placement path as a downloaded asset (normalize_furniture_to_box). Any failure
-# yields None and the caller falls back to the untextured procedural mesh.
-# ---------------------------------------------------------------------------
-
-AI_FURNITURE_PROMPT = """You are given a crop of a 2D architectural floorplan showing one piece of furniture
-(a {furniture_class}).
-
-Render THIS object as a photorealistic, perfectly top-down (orthographic plan view) product
-image of the real 3D piece it represents. The camera is directly overhead, looking straight
-down.
-
-Requirements:
-- The piece faces the same direction as in the floorplan (same orientation in the frame).
-- The piece is centered and fills most of the frame, with a small even margin on all sides.
-- Background: pure solid white (#ffffff), nothing else in the image.
-- Soft, even studio lighting with a subtle contact shadow.
-- No text, labels, dimension lines, borders, floor lines, or other objects."""
-
-
-def _image_response_may_retry(exc: Exception) -> bool:
-    """429/5xx (and UNAVAILABLE/RESOURCE_EXHAUSTED) are worth one retry."""
-    if GenAIClientError is not None and isinstance(exc, GenAIClientError):
-        code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-        return code in (408, 409, 425, 429, 500, 502, 503, 504)
-    return False
-
-
-def _decode_image_bytes(part: Any) -> bytes | None:
-    """Best-effort extraction of PNG/JPEG bytes from a google-genai response part."""
-    try:
-        img = part.as_image()
-        if img is not None:
-            if getattr(img, "image_bytes", None):
-                return img.image_bytes
-            if getattr(img, "_loaded_image", None) is not None:
-                buf = io.BytesIO()
-                img._loaded_image.save(buf, format="PNG")
-                return buf.getvalue()
-    except Exception:
-        pass
-    inline = getattr(part, "inline_data", None)
-    if inline is not None and getattr(inline, "data", None):
-        data = inline.data
-        if isinstance(data, str):  # some SDK versions hand back base64 text
-            import base64
-
-            try:
-                return base64.b64decode(data)
-            except Exception:
-                return None
-        return bytes(data)
-    return None
-
-
-def _crop_pad_floorplan(
-    image_bytes: bytes, box: list[int], pad_frac: float = 0.15
-) -> bytes | None:
-    """Crop a furniture footprint (0-1000 image units) out of the floorplan PNG."""
-    try:
-        from PIL import Image
-    except ImportError:  # pragma: no cover - pillow is in the Modal image
-        return None
-    ymin, xmin, ymax, xmax = box
-    try:
-        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception:
-        return None
-    W, H = im.size
-    x0 = xmin / 1000.0 * W
-    x1 = xmax / 1000.0 * W
-    y0 = ymin / 1000.0 * H
-    y1 = ymax / 1000.0 * H
-    w, h = x1 - x0, y1 - y0
-    if w < 2 or h < 2:
-        return None
-    px, py = w * pad_frac, h * pad_frac
-    crop = im.crop((
-        max(0, int(x0 - px)),
-        max(0, int(y0 - py)),
-        min(W, int(x1 + px)),
-        min(H, int(y1 + py)),
-    ))
-    side = max(crop.size)
-    canvas = Image.new("RGB", (side, side), (255, 255, 255))
-    canvas.paste(crop, ((side - crop.size[0]) // 2, (side - crop.size[1]) // 2))
-    buf = io.BytesIO()
-    canvas.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-async def _gen_furniture_view(
-    client: genai.Client, crop_png: bytes, el: dict[str, Any]
-) -> bytes | None:
-    """One Gemini image-model render of the furniture piece (top-down view)."""
-    prompt = AI_FURNITURE_PROMPT.format(
-        furniture_class=el.get("furniture_class") or "furniture"
-    )
-    if el.get("asset_search_query"):
-        prompt += f"\nFor reference, the piece looks like: {el['asset_search_query']}."
-    contents = [
-        genai_types.Part.from_bytes(data=crop_png, mime_type="image/png"),
-        prompt,
-    ]
-    cfg_kwargs: dict[str, Any] = {"temperature": 1.0}
-    try:  # IMAGE-only modality where the SDK exposes it
-        cfg_kwargs["response_modalities"] = ["IMAGE"]
-    except Exception:
-        pass
-    try:
-        cfg_kwargs["image_config"] = genai_types.ImageConfig(aspect_ratio="1:1")
-    except Exception:
-        pass
-    config = genai_types.GenerateContentConfig(**cfg_kwargs)
-
-    for attempt in (1, 2):
-        try:
-            resp = await client.aio.models.generate_content(
-                model=GEMINI_IMAGE_MODEL, contents=contents, config=config
-            )
-        except Exception as exc:
-            if attempt == 1 and _image_response_may_retry(exc):
-                await asyncio.sleep(2.0)
-                continue
-            logger.info("Gemini image generation failed: %s", exc)
-            return None
-        try:
-            for part in resp.parts or []:
-                data = _decode_image_bytes(part)
-                if data:
-                    return data
-        except Exception:
-            pass
-        return None
-    return None
-
-
-def _top_texture(mesh: trimesh.Trimesh, image_bytes: bytes) -> None:
-    """Planar-project `image_bytes` (a top-down render) onto the top of `mesh`.
-
-    UV u/v run along the mesh's x/y extents, so after placement the texture is
-    aligned with the furniture's footprint (both come from the same 2D box).
-    """
-    from PIL import Image
-
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    b = mesh.bounds
-    span_x = max(float(b[1][0] - b[0][0]), 1e-6)
-    span_y = max(float(b[1][1] - b[0][1]), 1e-6)
-    uv = np.column_stack([
-        (mesh.vertices[:, 0] - b[0][0]) / span_x,
-        (mesh.vertices[:, 1] - b[0][1]) / span_y,
-    ])
-    mat = trimesh.visual.material.PBRMaterial(
-        name="ai_top",
-        image=img,
-        baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
-        metallicFactor=0.0,
-        roughnessFactor=0.9,
-    )
-    mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=mat)
-
-
-def build_ai_furniture_glb(
-    furniture_class: str, box: list[int], view_png: bytes
-) -> bytes | None:
-    """Textured procedural piece -> standalone .glb, or None on any failure."""
-    try:
-        mesh = build_procedural_furniture(furniture_class or "furniture", box)
-        _top_texture(mesh, view_png)
-        data = mesh.export(file_type="glb")
-        return data if _looks_like_glb(data) else None
-    except Exception as exc:
-        logger.info("AI furniture glb build failed: %s", exc)
-        return None
-
-
-async def generate_ai_furniture_assets(
-    elements: list[dict[str, Any]], image_bytes: bytes
-) -> tuple[list[tuple[dict[str, Any], bytes]], list[str]]:
-    """Generate .glb models for furniture pieces via the Gemini image model."""
-    furniture = [e for e in elements if e["element_type"] == "furniture"]
-    logs = [
-        f"Generating AI models for {len(furniture)} furniture piece(s) "
-        f"with {GEMINI_IMAGE_MODEL}..."
-    ]
-    if not furniture:
-        return [], logs
-    try:
-        client = genai.Client()
-    except Exception as exc:
-        return [], [
-            f"Gemini client unavailable for image generation ({exc}) — no AI furniture."
-        ]
-
-    async def one(el: dict[str, Any]) -> bytes | None:
-        crop = _crop_pad_floorplan(image_bytes, el["box_2d"])
-        if crop is None:
-            return None
-        view = await _gen_furniture_view(client, crop, el)
-        if view is None:
-            return None
-        return build_ai_furniture_glb(el.get("furniture_class") or "furniture", el["box_2d"], view)
-
-    results = await asyncio.gather(*(one(el) for el in furniture))
-    ok: list[tuple[dict[str, Any], bytes]] = []
-    for el, data in zip(furniture, results, strict=True):
-        name = el.get("furniture_class") or "furniture"
-        if data is None:
-            logs.append(
-                f"AI model generation failed for '{name}' — procedural fallback will be used."
-            )
-        else:
-            logs.append(f"AI-generated model for '{name}' ({len(data)//1024} KB).")
-            ok.append((el, data))
-    return ok, logs
-
-
-# ---------------------------------------------------------------------------
-# Furniture normalization / placement
-# ---------------------------------------------------------------------------
-
-def _as_one_mesh(loaded: Any) -> trimesh.Trimesh:
-    """Coerce a trimesh.load() result to a single Trimesh (concatenating scenes)."""
-    if isinstance(loaded, trimesh.Trimesh):
-        return loaded
-    if isinstance(loaded, trimesh.Scene):
-        meshes = [g for g in loaded.dump(concatenate=False) if isinstance(g, trimesh.Trimesh)]
-        if not meshes:
-            raise ValueError("scene contains no triangle meshes")
-        if len(meshes) == 1:
-            return meshes[0]
-        return trimesh.util.concatenate(meshes)
-    raise ValueError(f"unsupported loaded object: {type(loaded)}")
-
-
-def normalize_furniture_to_box(mesh: trimesh.Trimesh, box: list[int]) -> trimesh.Trimesh:
-    """Fit `mesh` into the footprint described by `box` (image units), on the floor.
-
-    Uniform scale so (x-extent, y-extent) never exceeds the footprint; z scaled the
-    same. The mesh's minimum XY corner is placed at the box's minimum corner.
-    """
-    ymin, xmin, ymax, xmax = box
-    footprint_x = (xmax - xmin) * SCALE
-    footprint_y = (ymax - ymin) * SCALE
-
-    ext = mesh.extents  # current x/y/z extents
-    if not np.all(np.isfinite(ext)) or ext[:2].min() <= 1e-6:
-        raise ValueError("degenerate asset geometry")
-
-    s = min(footprint_x / ext[0], footprint_y / ext[1])
-    mesh.apply_scale(s)
-
-    # Re-ground: shift so the min corner sits exactly at the box min corner, z on floor.
-    mesh.apply_translation((-mesh.bounds[0][0], -mesh.bounds[0][1], -mesh.bounds[0][2]))
-    mesh.apply_translation((xmin * SCALE, -ymax * SCALE, 0.0))
-    return mesh
-
-
-# ---------------------------------------------------------------------------
-# Procedural furniture fallback (used when the web asset library has no match)
-# ---------------------------------------------------------------------------
-
-def _part(extents: tuple[float, float, float], offset: tuple[float, float, float],
-          mat: trimesh.visual.material.PBRMaterial) -> trimesh.Trimesh:
-    """A single box primitive at a local offset (min-corner anchored at origin)."""
-    m = trimesh.creation.box(extents=extents)
-    m.apply_translation((offset[0] + extents[0] / 2, offset[1] + extents[1] / 2, offset[2] + extents[2] / 2))
-    return mesh_with_material(m, mat)
-
-
-def _concat(parts: list[trimesh.Trimesh]) -> trimesh.Trimesh:
-    return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
-
-
-def _proc_bed(w: float, d: float, fab, wood) -> trimesh.Trimesh:
-    frame_h, matt_h, head_h, pillow_h = 0.30, 0.22, 0.95, 0.12
-    return _concat([
-        _part((w, d, frame_h), (0, 0, 0), wood),                                   # frame
-        _part((w, d * 0.12, head_h), (0, d * 0.88, 0), wood),                      # headboard
-        _part((w * 0.94, d * 0.82, matt_h), (w * 0.03, d * 0.03, frame_h), fab),   # mattress
-        _part((w * 0.40, d * 0.20, pillow_h), (w * 0.08, d * 0.66, frame_h + matt_h), fab),  # pillows
-        _part((w * 0.40, d * 0.20, pillow_h), (w * 0.52, d * 0.66, frame_h + matt_h), fab),
-    ])
-
-
-def _proc_sofa(w: float, d: float, fab, _wood) -> trimesh.Trimesh:
-    base_h, back_h, arm_h, arm_w = 0.40, 0.85, 0.60, min(0.18, w * 0.12)
-    seat_d = d - arm_w
-    return _concat([
-        _part((w, seat_d, base_h), (0, 0, 0), fab),                                # seat base
-        _part((w, d - seat_d, back_h), (0, seat_d, 0), fab),                       # backrest
-        _part((arm_w, d, arm_h), (0, 0, 0), fab),                                  # left arm
-        _part((arm_w, d, arm_h), (w - arm_w, 0, 0), fab),                          # right arm
-        _part((w - 2 * arm_w, seat_d * 0.9, 0.12), (arm_w, 0, base_h), fab),       # seat cushion
-    ])
-
-
-def _proc_table(w: float, d: float, wood, _fab) -> trimesh.Trimesh:
-    top_h, top_t, leg = 0.74, 0.04, 0.06
-    inset = leg * 0.6
-    leg_h = top_h - top_t
-    parts = [_part((w, d, top_t), (0, 0, leg_h), wood)]
-    for ox in (inset, w - inset - leg):
-        for oy in (inset, d - inset - leg):
-            parts.append(_part((leg, leg, leg_h), (ox, oy, 0), wood))
-    return _concat(parts)
-
-
-def _proc_chair(w: float, d: float, wood, _fab) -> trimesh.Trimesh:
-    seat_h, seat_t, back_h, leg = 0.45, 0.04, 0.90, 0.045
-    parts = [
-        _part((w, d, seat_t), (0, 0, seat_h - seat_t), wood),                      # seat
-        _part((w, seat_t, back_h - seat_h), (0, d - seat_t, seat_h), wood),        # backrest
-    ]
-    for ox in (0.0, w - leg):
-        for oy in (0.0, d - leg):
-            parts.append(_part((leg, leg, seat_h), (ox, oy, 0), wood))
-    return _concat(parts)
-
-
-def _proc_desk(w: float, d: float, wood, _fab) -> trimesh.Trimesh:
-    top_h, top_t = 0.74, 0.04
-    return _concat([
-        _part((w, d, top_t), (0, 0, top_h - top_t), wood),                         # top
-        _part((top_t, d, top_h), (0, 0, 0), wood),                                 # left panel
-        _part((top_t, d, top_h), (w - top_t, 0, 0), wood),                         # right panel
-    ])
-
-
-def _proc_wardrobe(w: float, d: float, wood, _fab) -> trimesh.Trimesh:
-    h = min(2.0, WALL_HEIGHT * 0.8)
-    handle = _part((0.03, 0.03, 0.18), (w / 2 - 0.015, -0.02, h / 2), pbr_material((90, 90, 95, 255), "handle"))
-    return _concat([_part((w, d, h), (0, 0, 0), wood), handle])
-
-
-def _proc_bathtub(w: float, d: float, ceram, _fab) -> trimesh.Trimesh:
-    h, rim = 0.55, 0.08
-    wall = 0.06
-    parts = [
-        _part((w, d, 0.06), (0, 0, 0), ceram),                                     # base
-        _part((w, rim, h), (0, 0, 0), ceram),                                      # near side
-        _part((w, rim, h), (0, d - rim, 0), ceram),                                # far side
-        _part((wall, d - 2 * rim, h), (0, rim, 0), ceram),                         # ends
-        _part((wall, d - 2 * rim, h), (w - wall, rim, 0), ceram),
-    ]
-    return _concat(parts)
-
-
-def _proc_toilet(w: float, d: float, ceram, _fab) -> trimesh.Trimesh:
-    return _concat([
-        _part((w * 0.7, d * 0.6, 0.42), (w * 0.15, 0, 0), ceram),                  # bowl
-        _part((w, d * 0.32, 0.75), (0, d * 0.66, 0), ceram),                       # cistern
-    ])
-
-
-def _proc_sink(w: float, d: float, ceram, _fab) -> trimesh.Trimesh:
-    return _concat([
-        _part((w * 0.16, w * 0.16, 0.78), (w / 2 - w * 0.08, d / 2 - w * 0.08, 0), ceram),  # pedestal
-        _part((w, d, 0.12), (0, 0, 0.78), ceram),                                  # basin
-    ])
-
-
-def _proc_stove(w: float, d: float, metal, _fab) -> trimesh.Trimesh:
-    h = 0.9
-    body = _part((w, d, h), (0, 0, 0), metal)
-    dark = pbr_material((35, 35, 38, 255), "burner")
-    r = min(w, d) * 0.18
-    parts = [body]
-    for ox, oy in ((0.28, 0.28), (0.72, 0.28), (0.28, 0.72), (0.72, 0.72)):
-        c = trimesh.creation.cylinder(radius=r, height=0.02, sections=20)
-        c.apply_translation((w * ox, d * oy, h + 0.01))
-        parts.append(mesh_with_material(c, dark))
-    return _concat(parts)
-
-
-def _proc_fridge(w: float, d: float, metal, _fab) -> trimesh.Trimesh:
-    h = 1.8
-    body = _part((w, d, h), (0, 0, 0), metal)
-    seam = _part((w + 0.005, d + 0.005, 0.01), (-0.0025, -0.0025, h * 0.62), pbr_material((70, 70, 74, 255), "seam"))
-    handle = _part((0.03, 0.03, 0.5), (w * 0.06, -0.02, h * 0.65), pbr_material((70, 70, 74, 255), "handle"))
-    return _concat([body, seam, handle])
-
-
-def _proc_generic(w: float, d: float, a, _b) -> trimesh.Trimesh:
-    return _part((w, d, 0.5), (0, 0, 0), a)
-
-
-def build_procedural_furniture(furniture_class: str, box: list[int]) -> trimesh.Trimesh:
-    """Synthesize a simple recognizable mesh for `furniture_class` that fits the
-    footprint `box`. Used when no downloadable asset matches, so rooms are never
-    left empty. The local mesh is built at the footprint's real size, then
-    grounded/scaled into place by the caller via normalize_furniture_to_box.
-    """
-    ymin, xmin, ymax, xmax = box
-    w = max((xmax - xmin) * SCALE, 0.2)
-    d = max((ymax - ymin) * SCALE, 0.2)
-
-    wood = pbr_material((150, 110, 74, 255), "proc_wood")
-    fab = pbr_material((120, 132, 150, 255), "proc_fabric")
-    ceram = pbr_material((238, 240, 242, 255), "proc_ceramic")
-    metal = pbr_material((200, 203, 208, 255), "proc_metal")
-
-    cls = (furniture_class or "").lower()
-    builder, mat = _proc_generic, wood
-    if "bed" in cls:
-        builder, mat = _proc_bed, fab
-    elif any(k in cls for k in ("sofa", "couch", "sectional", "loveseat")):
-        builder, mat = _proc_sofa, fab
-    elif "dining" in cls or ("table" in cls and "bed" not in cls):
-        builder, mat = _proc_table, wood
-    elif "chair" in cls or "stool" in cls or "armchair" in cls:
-        builder, mat = _proc_chair, wood
-    elif "desk" in cls:
-        builder, mat = _proc_desk, wood
-    elif any(k in cls for k in ("wardrobe", "closet", "cabinet", "dresser", "bookshelf", "shelf")):
-        builder, mat = _proc_wardrobe, wood
-    elif "bath" in cls or "tub" in cls:
-        builder, mat = _proc_bathtub, ceram
-    elif "toilet" in cls or "wc" in cls:
-        builder, mat = _proc_toilet, ceram
-    elif "sink" in cls or "vanity" in cls or "basin" in cls:
-        builder, mat = _proc_sink, ceram
-    elif "stove" in cls or "oven" in cls or "cooktop" in cls or "range" in cls:
-        builder, mat = _proc_stove, metal
-    elif "fridge" in cls or "refrigerator" in cls or "freezer" in cls:
-        builder, mat = _proc_fridge, metal
-
-    return builder(w, d, mat, fab)
-
 
 # ---------------------------------------------------------------------------
 # Ceiling / roof
@@ -1022,7 +608,7 @@ def _hex_to_rgba(value: Any) -> Optional[tuple[int, int, int, int]]:
 
 
 def _room_wall_material(room_colors: Optional[dict[str, Any]]) -> trimesh.visual.material.PBRMaterial:
-    """Pick a single accent wall color from Gemini's room_colors (average)."""
+    """Pick a single accent wall color from the model's room_colors (average)."""
     if not room_colors:
         return pbr_material((238, 238, 234, 255), "wall_white")
     rgba = None
@@ -1041,7 +627,6 @@ def _room_wall_material(room_colors: Optional[dict[str, Any]]) -> trimesh.visual
 
 def assemble_glb_bytes(
     elements: list[dict[str, Any]],
-    furniture_assets: list[tuple[dict[str, Any], bytes]],
     include_ceiling: bool = False,
     room_colors: Optional[dict[str, Any]] = None,
 ) -> tuple[bytes, list[str]]:
@@ -1054,57 +639,13 @@ def assemble_glb_bytes(
         logs.append("Added ceiling/roof slab.")
 
     if room_colors:
-        logs.append(f"Applied room wall tint from Gemini room_colors ({len(room_colors)} room(s)).")
+        logs.append(f"Applied room wall tint from room_colors ({len(room_colors)} room(s)).")
 
-    placed_real = 0
-    placed_proc = 0
-    fetched_boxes = {id(el) for el, _ in furniture_assets}
-    real_nodes: list[str] = []
-
-    for i, (el, data) in enumerate(furniture_assets):
-        name = el.get("furniture_class") or f"furniture_{i}"
-        try:
-            loaded = trimesh.load(io.BytesIO(data), file_type="glb", force="mesh", process=False)
-            mesh = _as_one_mesh(loaded)
-            mesh = normalize_furniture_to_box(mesh, el["box_2d"])
-            node = f"furn_{i}_{name}"
-            scene.add_geometry(mesh, node_name=node, geom_name=node)
-            real_nodes.append(node)
-            placed_real += 1
-        except Exception as exc:
-            logs.append(f"Could not place asset for '{name}' ({type(exc).__name__}: {exc}) — will synthesize instead.")
-            fetched_boxes.discard(id(el))
-
-    # Procedural fallback: every furniture element that did NOT get a real asset
-    # becomes a recognizable placeholder so no room is left empty.
-    furniture_elements = [e for e in elements if e["element_type"] == "furniture"]
-    for j, el in enumerate(furniture_elements):
-        if id(el) in fetched_boxes:
-            continue
-        name = el.get("furniture_class") or "furniture"
-        try:
-            mesh = build_procedural_furniture(name, el["box_2d"])
-            mesh = normalize_furniture_to_box(mesh, el["box_2d"])
-            node = f"proc_{j}_{name}"
-            scene.add_geometry(mesh, node_name=node, geom_name=node)
-            placed_proc += 1
-        except Exception as exc:
-            logs.append(f"Could not synthesize placeholder for '{name}' ({type(exc).__name__}: {exc}) — skipping.")
-
-    if furniture_elements:
-        logs.append(
-            f"Furniture: {placed_real} matched asset(s) from the web, "
-            f"{placed_proc} procedural placeholder(s), {len(furniture_elements)} total."
-        )
-
-    # Stash a small manifest in the GLB's scene extras so the viewer can tell
-    # ceiling/real/procedural nodes apart.
+    # Stash a small manifest in the GLB's scene extras so the viewer can find
+    # the ceiling node.
     try:
         scene.metadata["dolgen"] = {
             "ceiling_node": "ceiling" if include_ceiling else None,
-            "real_furniture": real_nodes,
-            "placed_real": placed_real,
-            "placed_procedural": placed_proc,
         }
     except Exception:
         pass
@@ -1115,17 +656,17 @@ def assemble_glb_bytes(
 
 
 def create_app() -> FastAPI:
-    web = FastAPI(title="DolGen — Floorplan to 3D Dollhouse")
+    web = FastAPI(title="DolGen — Floorplan to 3D Dollhouse (structure)")
 
     # The React frontend (Vite dev server or a deployed static build) calls
     # /generate-3d cross-origin; the custom headers must be exposed for the
-    # pipeline log / furniture source to be readable from JS.
+    # pipeline log to be readable from JS.
     web.add_middleware(
         CORSMiddleware,
         allow_origins=ALLOWED_ORIGINS,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
-        expose_headers=["X-DolGen-Log", "X-DolGen-Furniture", "Content-Disposition"],
+        expose_headers=["X-DolGen-Log", "Content-Disposition"],
     )
 
     @web.get("/", response_class=HTMLResponse)
@@ -1141,7 +682,6 @@ def create_app() -> FastAPI:
         file: UploadFile = File(...),
         ceiling: str = Form("false"),
         room_colors: str = Form(""),
-        furniture_source: str = Form("auto"),
     ) -> StreamingResponse:
         mime = (file.content_type or "").lower()
         data = await file.read()
@@ -1154,12 +694,20 @@ def create_app() -> FastAPI:
         if not mime.startswith("image/"):
             mime = "image/png"
 
-        furniture_source = (furniture_source or "auto").strip().lower()
-        if furniture_source not in ("auto", "assets", "ai", "procedural"):
-            raise HTTPException(
-                status_code=422,
-                detail=f"Unknown furniture_source '{furniture_source}' (auto|assets|ai|procedural).",
-            )
+        # Preprocess: EXIF fix, upscale, denoise, background normalization, and a
+        # binary wall mask (structure only — furniture strokes are discarded).
+        # Any failure keeps the raw upload so extraction still works.
+        prep_logs: list[str] = []
+        try:
+            prepped, prepped_mime = preprocess_floorplan(data)
+            if prepped_mime:
+                data, mime = prepped, prepped_mime
+                prep_logs.append("Preprocessed floorplan (denoise + white balance + wall mask).")
+            else:
+                prep_logs.append("Preprocessing could not decode the upload — using the raw image.")
+        except Exception as exc:
+            logger.warning("Preprocessing failed (%s); using raw upload", exc)
+            prep_logs.append("Preprocessing failed — using the raw image.")
 
         parsed = await extract_elements(data, mime)
         elements = normalize_elements(parsed)
@@ -1167,9 +715,9 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=422, detail="No usable elements were detected in the floorplan.")
         if not any(e["element_type"] == "wall" for e in elements):
             # Walls are the backbone of the dollhouse; without them the output is misleading.
-            raise HTTPException(status_code=422, detail="Gemini detected no walls in this floorplan.")
+            raise HTTPException(status_code=422, detail="Kimi detected no walls in this floorplan.")
 
-        # Optional per-room wall colors suggested by Gemini (or sent by the client).
+        # Optional per-room wall colors sent by the client.
         colors: Optional[dict[str, Any]] = None
         if room_colors:
             try:
@@ -1180,36 +728,11 @@ def create_app() -> FastAPI:
                 logger.info("Ignoring malformed room_colors form field")
         include_ceiling = str(ceiling).lower() in ("1", "true", "yes", "on")
 
-        # Resolve furniture models per the requested source.
-        asset_logs: list[str] = []
-        if furniture_source == "procedural":
-            furniture_assets: list[tuple[dict[str, Any], bytes]] = []
-            mode_label = "procedural"
-        elif furniture_source == "assets":
-            furniture_assets, asset_logs = await download_assets(elements)
-            mode_label = "assets"
-        elif furniture_source == "ai":
-            furniture_assets, asset_logs = await generate_ai_furniture_assets(elements, data)
-            mode_label = "ai"
-        else:  # auto: web asset library first, AI generation for the misses
-            furniture_assets, asset_logs = await download_assets(elements)
-            matched = {id(el) for el, _ in furniture_assets}
-            remaining = [
-                e
-                for e in elements
-                if e["element_type"] == "furniture" and id(e) not in matched
-            ]
-            if remaining:
-                ai_assets, ai_logs = await generate_ai_furniture_assets(remaining, data)
-                furniture_assets = furniture_assets + ai_assets
-                asset_logs += ai_logs
-            mode_label = "auto"
-
         glb, scene_logs = assemble_glb_bytes(
-            elements, furniture_assets, include_ceiling=include_ceiling, room_colors=colors
+            elements, include_ceiling=include_ceiling, room_colors=colors
         )
 
-        logs = asset_logs + scene_logs
+        logs = prep_logs + scene_logs
         logger.info("generate_3d ok: %s", " | ".join(logs))
         # HTTP headers are latin-1; keep the pipeline log ASCII-safe for the wire.
         header_log = " | ".join(logs).encode("ascii", "replace").decode("ascii")[:1800]
@@ -1219,7 +742,6 @@ def create_app() -> FastAPI:
             headers={
                 "Content-Disposition": 'attachment; filename="dollhouse.glb"',
                 "X-DolGen-Log": header_log,
-                "X-DolGen-Furniture": mode_label,
             },
         )
 
@@ -1229,8 +751,7 @@ def create_app() -> FastAPI:
 @app.function(
     image=image,
     secrets=[
-        modal.Secret.from_name("gemini-secret"),
-        modal.Secret.from_name("asset-api-secret"),
+        modal.Secret.from_name("kimi-verify"),
     ],
     timeout=600,
     memory=2048,
@@ -1344,7 +865,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <main id="view">
     <div id="empty"><div class="big">📐 → 🏠</div><div>Upload a floorplan to render your dollhouse.<br/>Progressive path tracing will converge once the model loads.</div></div>
   </main>
-  <div id="busy"><div class="dots"><span>●</span><span>●</span><span>●</span></div><div id="busymsg">Analyzing with Gemini — this takes ~10–30 s</div></div>
+  <div id="busy"><div class="dots"><span>●</span><span>●</span><span>●</span></div><div id="busymsg">Analyzing with Kimi K3 — this takes ~10–30 s</div></div>
 
 <script type="importmap">
 {
@@ -1504,7 +1025,7 @@ async function generate() {
   if (!pickedFile) return;
   goBtn.disabled = true;
   busyEl.classList.add('show');
-  log('Uploading floorplan to Gemini…');
+  log('Uploading floorplan to Kimi K3…');
   try {
     const form = new FormData();
     form.append('file', pickedFile);

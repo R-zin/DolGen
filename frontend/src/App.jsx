@@ -2,20 +2,12 @@ import { useCallback, useRef, useState } from 'react'
 import './App.css'
 import PathTracerView from './PathTracerView.jsx'
 
-const FURNITURE_SOURCES = [
-  { id: 'auto', label: 'Auto', note: 'Asset library first, AI generates the rest' },
-  { id: 'assets', label: 'Assets', note: 'Web asset library only (fastest)' },
-  { id: 'ai', label: 'AI (Nano Banana Pro)', note: 'Gemini image model generates each piece' },
-  { id: 'procedural', label: 'Procedural', note: 'Simple built-in meshes, no network' },
-]
-
 export default function App() {
   const [file, setFile] = useState(null)
   const [previewUrl, setPreviewUrl] = useState(null)
   const [drag, setDrag] = useState(false)
   const [busy, setBusy] = useState(false)
   const [glb, setGlb] = useState(null)
-  const [source, setSource] = useState('auto')
   const [ceiling, setCeiling] = useState(false)
   const [spin, setSpin] = useState(false)
   const [quality, setQuality] = useState(1024)
@@ -41,12 +33,11 @@ export default function App() {
   const generate = useCallback(async () => {
     if (!file || busy) return
     setBusy(true)
-    log(`Uploading floorplan — extracting with Gemini, furniture: ${source}…`)
+    log('Uploading floorplan — extracting structure with Kimi K3…')
     try {
       const form = new FormData()
       form.append('file', file)
       form.append('ceiling', ceiling ? 'true' : 'false')
-      form.append('furniture_source', source)
       const res = await fetch('/generate-3d', { method: 'POST', body: form })
       if (!res.ok) {
         let detail = await res.text()
@@ -61,8 +52,6 @@ export default function App() {
       if (serverLog) {
         serverLog.split(' | ').forEach((l) => log(l, /failed/i.test(l) ? 'err' : ''))
       }
-      const mode = res.headers.get('X-DolGen-Furniture')
-      if (mode) log(`Furniture pipeline: ${mode}`)
 
       const buf = await res.arrayBuffer()
       log(`Received ${(buf.byteLength / 1024).toFixed(0)} KB GLB — loading…`)
@@ -75,7 +64,7 @@ export default function App() {
     } finally {
       setBusy(false)
     }
-  }, [file, busy, ceiling, source, log])
+  }, [file, busy, ceiling, log])
 
   const download = useCallback(() => {
     if (!glb) return
@@ -110,8 +99,6 @@ export default function App() {
     },
     [log],
   )
-
-  const srcNote = FURNITURE_SOURCES.find((s) => s.id === source)?.note
 
   return (
     <div className="app">
@@ -149,23 +136,6 @@ export default function App() {
           )}
         </div>
         {file && <div className="filename">{file.name}</div>}
-
-        <div className="field">
-          <span className="label">Furniture source</span>
-          <div className="seg">
-            {FURNITURE_SOURCES.map((s) => (
-              <button
-                key={s.id}
-                className={source === s.id ? 'active' : ''}
-                onClick={() => setSource(s.id)}
-                title={s.note}
-              >
-                {s.label}
-              </button>
-            ))}
-          </div>
-          <span className="note">{srcNote}</span>
-        </div>
 
         <button className="go" disabled={!file || busy} onClick={generate}>
           Generate Path-Traced Dollhouse
@@ -255,8 +225,7 @@ export default function App() {
             <span>●</span>
           </div>
           <div className="busymsg">
-            Analyzing with Gemini{source === 'ai' || source === 'auto' ? ' + generating models' : ''} —
-            this can take ~10–60 s
+            Analyzing structure with Kimi K3 — this can take ~10–30 s
           </div>
         </div>
       )}

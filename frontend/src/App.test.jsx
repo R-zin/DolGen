@@ -23,8 +23,6 @@ describe('App', () => {
     expect(screen.getByRole('heading', { level: 1 })).toBeTruthy()
     const btn = screen.getByRole('button', { name: /Generate Path-Traced Dollhouse/i })
     expect(btn.disabled).toBe(true)
-    // furniture source segmented control present
-    expect(screen.getByText('AI (Nano Banana Pro)')).toBeTruthy()
   })
 
   it('enables generate after picking a file', () => {
@@ -41,7 +39,6 @@ describe('App', () => {
       ok: true,
       headers: new Headers({
         'X-DolGen-Log': 'Extraction: 4 walls | Exported dollhouse GLB',
-        'X-DolGen-Furniture': 'auto',
       }),
       arrayBuffer: async () => glbBytes.buffer,
     })
@@ -59,33 +56,15 @@ describe('App', () => {
     const [url, opts] = fetchMock.mock.calls[0]
     expect(url).toBe('/generate-3d')
     expect(opts.method).toBe('POST')
-    expect(opts.body.get('furniture_source')).toBe('auto')
     expect(opts.body.get('ceiling')).toBe('false')
-  })
-
-  it('sends the selected furniture source', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      headers: new Headers(),
-      arrayBuffer: async () => new ArrayBuffer(8),
-    })
-    vi.stubGlobal('fetch', fetchMock)
-
-    render(<App />)
-    fireEvent.change(document.querySelector('input[type=file]'), {
-      target: { files: [makeFile()] },
-    })
-    fireEvent.click(screen.getByText('AI (Nano Banana Pro)'))
-    fireEvent.click(screen.getByRole('button', { name: /Generate Path-Traced Dollhouse/i }))
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
-    expect(fetchMock.mock.calls[0][1].body.get('furniture_source')).toBe('ai')
+    expect(opts.body.get('furniture_source')).toBeNull()
   })
 
   it('logs an error when the server rejects', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,
       status: 422,
-      text: async () => JSON.stringify({ detail: 'Gemini detected no walls in this floorplan.' }),
+      text: async () => JSON.stringify({ detail: 'Kimi detected no walls in this floorplan.' }),
     })
     vi.stubGlobal('fetch', fetchMock)
 

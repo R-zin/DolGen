@@ -10,10 +10,10 @@ pytest-asyncio
 # test the pure-geometry pipeline without any secrets or network).
 fastapi
 python-multipart
-google-genai
+openai
 trimesh[all]
 manifold3d>=2.3.0
 scipy
 networkx
-httpx
 pillow
+opencv-python-headless

@@ -1,8 +1,9 @@
 """Offline tests for DolGen's geometry/assembly pipeline.
 
-These never touch Gemini or the asset API — they build a small synthetic
-floorplan element list and run the real builders end to end, asserting the
-scene graph, the GLB export, and the furniture fallback/ceiling/color logic.
+These never touch the Kimi endpoint — they build a small synthetic floorplan
+element list and run the real builders end to end, asserting the scene graph,
+the GLB export, the ceiling/color logic, the OpenCV preprocessing helpers, and
+the Kimi response parsing/schema helpers.
 """
 
 from __future__ import annotations
@@ -11,21 +12,17 @@ import pytest
 
 import app
 
-# A simple one-room floorplan: four walls, a door, a window, and furniture.
+# A simple one-room floorplan: four walls, a door, and a window.
 ELEMENTS = [
     # exterior walls (thin segments on a 0-1000 grid); door/window boxes sit
     # mid-span on a single wall so the boolean cut never splits a wall in two.
-    {"element_type": "wall", "furniture_class": None, "asset_search_query": None, "box_2d": [100, 100, 130, 900]},   # top
-    {"element_type": "wall", "furniture_class": None, "asset_search_query": None, "box_2d": [870, 100, 900, 900]},   # bottom
-    {"element_type": "wall", "furniture_class": None, "asset_search_query": None, "box_2d": [100, 100, 900, 130]},   # left
-    {"element_type": "wall", "furniture_class": None, "asset_search_query": None, "box_2d": [100, 870, 900, 900]},   # right
+    {"element_type": "wall", "box_2d": [100, 100, 130, 900]},   # top
+    {"element_type": "wall", "box_2d": [870, 100, 900, 900]},   # bottom
+    {"element_type": "wall", "box_2d": [100, 100, 900, 130]},   # left
+    {"element_type": "wall", "box_2d": [100, 870, 900, 900]},   # right
     # a door mid-span on the bottom wall, a window mid-span on the left wall
-    {"element_type": "door", "furniture_class": None, "asset_search_query": None, "box_2d": [878, 300, 892, 420]},
-    {"element_type": "window", "furniture_class": None, "asset_search_query": None, "box_2d": [400, 108, 560, 122]},
-    # furniture (no asset download in tests -> all become procedural)
-    {"element_type": "furniture", "furniture_class": "bed", "asset_search_query": "oak queen bed frame", "box_2d": [200, 200, 420, 400]},
-    {"element_type": "furniture", "furniture_class": "sofa", "asset_search_query": "grey fabric sofa", "box_2d": [600, 600, 800, 800]},
-    {"element_type": "furniture", "furniture_class": "mystery_object", "asset_search_query": "weird thing", "box_2d": [500, 150, 600, 250]},
+    {"element_type": "door", "box_2d": [878, 300, 892, 420]},
+    {"element_type": "window", "box_2d": [400, 108, 560, 122]},
 ]
 
 
@@ -70,32 +67,15 @@ def test_build_shell_has_floor_and_walls():
     assert any("4 walls" in line for line in logs)
 
 
-@pytest.mark.parametrize("cls", [
-    "bed", "sofa", "dining_table", "chair", "desk", "wardrobe",
-    "bathtub", "toilet", "sink", "stove", "fridge", "totally_unknown",
-])
-def test_procedural_furniture_builds_valid_mesh(cls):
-    mesh = app.build_procedural_furniture(cls, [0, 0, 100, 100])
-    assert mesh.extents.max() > 0.05
-    placed = app.normalize_furniture_to_box(mesh, [200, 200, 400, 400])
-    # grounded on the floor
-    assert placed.bounds[0][2] == pytest.approx(0.0, abs=1e-6)
-    # fits inside its footprint
-    assert placed.extents[0] <= 200 * app.SCALE + 1e-6
-    assert placed.extents[1] <= 200 * app.SCALE + 1e-6
-
-
-def test_assemble_without_assets_uses_procedural_fallback():
-    glb, logs = app.assemble_glb_bytes(ELEMENTS, furniture_assets=[])
+def test_assemble_exports_valid_glb():
+    glb, logs = app.assemble_glb_bytes(ELEMENTS)
     assert isinstance(glb, (bytes, bytearray)) and len(glb) > 0
     assert glb[:4] == b"glTF"
-    # 3 furniture pieces, 0 real assets -> 3 procedural placeholders
-    assert any("procedural placeholder(s)" in line for line in logs)
     assert any(line.startswith("Exported dollhouse GLB") for line in logs)
 
 
 def test_assemble_with_ceiling_adds_named_node():
-    glb, logs = app.assemble_glb_bytes(ELEMENTS, [], include_ceiling=True)
+    glb, logs = app.assemble_glb_bytes(ELEMENTS, include_ceiling=True)
     assert any("ceiling" in line.lower() for line in logs)
     scene = app.trimesh.load(app.io.BytesIO(glb), file_type="glb", force="scene", process=False)
     names = set(scene.geometry.keys())
@@ -103,7 +83,7 @@ def test_assemble_with_ceiling_adds_named_node():
 
 
 def test_room_wall_tint_applies():
-    glb, logs = app.assemble_glb_bytes(ELEMENTS, [], room_colors={"bedroom": "#3a6ea5"})
+    glb, logs = app.assemble_glb_bytes(ELEMENTS, room_colors={"bedroom": "#3a6ea5"})
     assert any("room wall tint" in line for line in logs)
     assert glb[:4] == b"glTF"
 
@@ -115,28 +95,7 @@ def test_hex_to_rgba_valid_and_invalid():
     assert app._hex_to_rgba(123) is None
 
 
-def test_glb_validator_rejects_garbage():
-    assert app._looks_like_glb(b"glTF" + b"\x00" * 20)
-    assert not app._looks_like_glb(b"not a glb")
-    assert not app._glb_parses(b"glTF" + b"\x00" * 20)
-
-
-def test_cache_key_is_stable():
-    a = app._cache_key("Oak Queen Bed Frame")
-    b = app._cache_key("  oak queen bed frame ")
-    assert a == b and a.endswith(".glb")
-
-
-# --- AI-generated furniture (Gemini image model "nano banana pro") ----------
-
-# 1x1 white PNG
-_PNG_1PX = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
-    b"\x00\x00\x00\x03\x00\x01\x00\x05\xfe\xd4\x8f\x1d\x00\x00\x00\x00IEND"
-    b"\xaeB`\x82"
-)
-
+# --- Preprocessing (OpenCV wall mask) ---------------------------------------
 
 def _make_png(w: int = 64, h: int = 48, rgb=(255, 255, 255)) -> bytes:
     from PIL import Image
@@ -147,53 +106,129 @@ def _make_png(w: int = 64, h: int = 48, rgb=(255, 255, 255)) -> bytes:
     return buf.getvalue()
 
 
-def test_crop_pad_floorplan_returns_square_png():
-    plan = _make_png(1000, 1000)
-    out = app._crop_pad_floorplan(plan, [200, 200, 420, 400])
-    assert out is not None
-    from PIL import Image
+def _synthetic_floorplan_png(w: int = 400, h: int = 300) -> bytes:
+    """White plan with thick black walls, a small square (furniture), and noise."""
+    import numpy as np
+    from PIL import Image, ImageDraw
 
-    im = Image.open(app.io.BytesIO(out))
-    assert im.size[0] == im.size[1]  # square canvas
-    assert im.size[0] > 0
-
-
-def test_crop_pad_floorplan_degenerate_returns_none():
-    plan = _make_png(100, 100)
-    assert app._crop_pad_floorplan(plan, [0, 0, 0, 0]) is None
-    assert app._crop_pad_floorplan(b"not an image", [0, 0, 100, 100]) is None
-
-
-def test_build_ai_furniture_glb_produces_valid_glb():
-    tex = _make_png(32, 32, (180, 120, 80))
-    data = app.build_ai_furniture_glb("sofa", [0, 0, 100, 100], tex)
-    assert data is not None
-    assert app._looks_like_glb(data)
-    assert app._glb_parses(data)
-    # it loads as a mesh with a texture applied
-    mesh = app.trimesh.load(app.io.BytesIO(data), file_type="glb", force="mesh", process=False)
-    assert mesh.visual is not None
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    # outer walls, ~8 px thick (well above the 3 px opening pass)
+    d.rectangle([40, 40, w - 41, h - 41], outline=(0, 0, 0), width=8)
+    # one interior wall
+    d.line([w // 2, 40, w // 2, h - 41], fill=(0, 0, 0), width=8)
+    # small furniture-like square inside a room (should be removed by the mask)
+    d.rectangle([70, 70, 100, 100], outline=(0, 0, 0), width=2)
+    arr = np.asarray(img).astype(np.int16)
+    arr += np.random.default_rng(7).integers(-12, 13, arr.shape, dtype=np.int16)
+    img = Image.fromarray(arr.clip(0, 255).astype("uint8"))
+    buf = app.io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
-def test_build_ai_furniture_glb_bad_texture_returns_none():
-    assert app.build_ai_furniture_glb("bed", [0, 0, 100, 100], b"garbage") is None
+def test_wall_mask_keeps_walls_drops_small_components():
+    png = _synthetic_floorplan_png()
+    bgr = app._bytes_to_bgr(png)
+    assert bgr is not None
+    gray = app._normalize_floorplan(bgr)
+    mask = app.build_wall_mask(gray)
+    assert mask.shape == gray.shape
+
+    dark = mask < 128
+    # the long walls survive as dark lines; the small furniture square does not
+    assert dark[mask.shape[0] // 2, mask.shape[1] // 2]  # interior wall midline
+    assert not dark[85 * mask.shape[0] // 300, 85 * mask.shape[1] // 400]  # furniture square
+    # mask is strictly binary
+    assert set(app.np.unique(mask).tolist()) <= {0, 255}
 
 
-def test_image_response_may_retry_codes():
-    class FakeErr(Exception):
-        def __init__(self, code):
-            self.code = code
-            super().__init__(str(code))
+def test_preprocess_floorplan_returns_png_bytes():
+    png = _synthetic_floorplan_png()
+    out, mime = app.preprocess_floorplan(png)
+    assert mime == "image/png"
+    assert out[:8] == b"\x89PNG\r\n\x1a\n"
 
-    if app.GenAIClientError is None:
-        import pytest as _p
 
-        _p.skip("google-genai ClientError not available")
-    # Build real ClientError instances
-    from google.genai.errors import ClientError
+def test_preprocess_floorplan_garbage_falls_back():
+    out, mime = app.preprocess_floorplan(b"not an image at all")
+    assert out == b"not an image at all"
+    assert mime == ""
 
-    e429 = ClientError(code=429, response_json={"error": {"message": "quota"}})
-    e400 = ClientError(code=400, response_json={"error": {"message": "bad"}})
-    assert app._image_response_may_retry(e429) is True
-    assert app._image_response_may_retry(e400) is False
-    assert app._image_response_may_retry(FakeErr(503)) is False  # not a ClientError
+
+# --- Kimi response parsing / schema (offline) -------------------------------
+
+def test_parse_elements_text_raw_array():
+    text = '[{"element_type": "wall", "box_2d": [10, 10, 200, 40]}]'
+    out = app._parse_elements_text(text)
+    assert len(out) == 1
+    assert out[0].element_type == "wall"
+    assert out[0].box_2d == [10, 10, 200, 40]
+
+
+def test_parse_elements_text_wrapped_object():
+    text = '{"elements": [{"element_type": "door", "box_2d": [1, 2, 3, 4]}]}'
+    out = app._parse_elements_text(text)
+    assert len(out) == 1
+    assert out[0].element_type == "door"
+
+
+def test_parse_elements_text_fenced_json():
+    text = '```json\n[{"element_type": "window", "box_2d": [5, 6, 7, 8]}]\n```'
+    out = app._parse_elements_text(text)
+    assert len(out) == 1
+    assert out[0].element_type == "window"
+
+
+def test_parse_elements_text_drops_invalid_entries():
+    text = (
+        '[{"element_type": "wall", "box_2d": [1, 2, 3, 4]},'
+        ' {"element_type": "sofa", "box_2d": [1, 2, 3, 4]},'
+        ' {"element_type": "wall", "box_2d": [1, 2, 3]}]'
+    )
+    out = app._parse_elements_text(text)
+    # only the valid wall survives; bad type and bad box are dropped
+    assert len(out) == 1
+    assert out[0].element_type == "wall"
+
+
+def test_parse_elements_text_garbage_returns_empty():
+    assert app._parse_elements_text("") == []
+    assert app._parse_elements_text(None) == []
+    assert app._parse_elements_text("not json") == []
+    assert app._parse_elements_text('{"a": 1}') == []
+
+
+def test_elements_json_schema_is_array_of_floor_element():
+    spec = app._elements_json_schema()
+    assert spec["schema"]["type"] == "array"
+    assert spec["strict"] is True
+    items = spec["schema"]["items"]
+    assert set(items["properties"]) == {"element_type", "box_2d"}
+    assert set(items["required"]) == {"element_type", "box_2d"}
+
+
+def test_kimi_client_token_fallback(monkeypatch):
+    # Kimi-specific pair wins when both are set
+    monkeypatch.setenv("KIMI_TOKEN_ID", "kid")
+    monkeypatch.setenv("KIMI_TOKEN_SECRET", "ksec")
+    monkeypatch.setenv("MODAL_TOKEN_ID", "mid")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "msec")
+    monkeypatch.setattr(app, "KIMI_BASE_URL", "https://example.test/v1")
+    client = app._kimi_client()
+    assert client.api_key == "kid:ksec"
+
+    # falls back to the Modal workspace tokens
+    monkeypatch.delenv("KIMI_TOKEN_ID")
+    monkeypatch.delenv("KIMI_TOKEN_SECRET")
+    client = app._kimi_client()
+    assert client.api_key == "mid:msec"
+
+
+def test_kimi_client_missing_config_raises(monkeypatch):
+    for var in ("KIMI_TOKEN_ID", "KIMI_TOKEN_SECRET", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(app, "KIMI_BASE_URL", "")
+    with pytest.raises(app.HTTPException) as exc:
+        app._kimi_client()
+    assert exc.value.status_code == 500
