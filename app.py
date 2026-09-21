@@ -100,7 +100,7 @@ FLOOR_THICKNESS = 0.10     # meters (floor slab extends downward from z=0)
 # read from KIMI_TOKEN_ID / KIMI_TOKEN_SECRET if present, falling back to the
 # Modal workspace tokens MODAL_TOKEN_ID / MODAL_TOKEN_SECRET (what a Modal-
 # hosted endpoint typically expects).
-KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k3")
+KIMI_MODEL = os.environ.get("KIMI_MODEL", "moonshotai/Kimi-K3")
 KIMI_BASE_URL = os.environ.get("KIMI_BASE_URL", "")
 KIMI_TIMEOUT_S = float(os.environ.get("KIMI_TIMEOUT_S", "120"))
 MAX_IMAGE_BYTES = 20 * 1024 * 1024          # 20 MB upload cap
@@ -278,9 +278,12 @@ def _kimi_client() -> AsyncOpenAI:
                 "MODAL_TOKEN_ID/MODAL_TOKEN_SECRET workspace tokens)."
             ),
         )
+    # A Modal-hosted endpoint authenticates through Modal's proxy, which wants the
+    # workspace token pair joined with a DOT: `Bearer wk-<id>.ws-<secret>` (the
+    # proxy rejects the colon form with a 401 naming this exact format).
     return AsyncOpenAI(
         base_url=KIMI_BASE_URL,
-        api_key=f"{token_id}:{token_secret}",
+        api_key=f"{token_id}.{token_secret}",
         timeout=KIMI_TIMEOUT_S,
         max_retries=1,
     )
@@ -755,6 +758,7 @@ def create_app() -> FastAPI:
     ],
     timeout=600,
     memory=2048,
+    min_containers=0,  # scale to zero when idle — no warm containers left running
 )
 @modal.asgi_app()
 def fastapi_app() -> FastAPI:
