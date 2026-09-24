@@ -2,7 +2,6 @@ import { Component, useEffect, useImperativeHandle, useRef, forwardRef } from 'r
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
 import { WebGLPathTracer } from 'three-gpu-pathtracer'
 
 /**
@@ -15,7 +14,8 @@ import { WebGLPathTracer } from 'three-gpu-pathtracer'
  * Notes vs. the old inline viewer:
  *  - the loop calls pathTracer.renderSample() every frame (it never resets each
  *    frame, so samples actually accumulate and converge),
- *  - an environment map is provided (RoomEnvironment) so the path tracer has
+ *  - an environment map is provided (a small equirect DataTexture gradient —
+ *    PMREM/CubeUV env maps crash this lib, see below) so the path tracer has
  *    something to light the scene with — without it the render was black,
  *  - uses the 0.0.24 API (renderSample/enablePathTracing/setScene); there is no
  *    targetSamples/visible flag on this version.
@@ -51,8 +51,11 @@ const PathTracerView = forwardRef(function PathTracerView(
     const scene = new THREE.Scene()
     scene.background = new THREE.Color(0x1a1d22)
     // Environment lighting so the path tracer has something to bounce.
-    const pmrem = new THREE.PMREMGenerator(renderer)
-    const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture
+    // three-gpu-pathtracer 0.0.24's EquirectHdrInfoUniform.updateFrom() reads
+    // CPU pixel data from envMap.image.data, so the environment must be an
+    // equirect DataTexture — a PMREM/RoomEnvironment (CubeUV, GPU-only, no
+    // .data) makes setScene() throw "Cannot read properties of undefined".
+    const envTex = makeGradientEnvTexture()
     scene.environment = envTex
     scene.environmentIntensity = 0.9
 
@@ -66,7 +69,6 @@ const PathTracerView = forwardRef(function PathTracerView(
     controls.autoRotateSpeed = 1.4
 
     const pathTracer = new WebGLPathTracer(renderer)
-    pathTracer.tiles = 3
     pathTracer.renderScale = 0.85
     pathTracer.dynamicLowRes = true
     pathTracer.minSamples = 3
@@ -78,7 +80,6 @@ const PathTracerView = forwardRef(function PathTracerView(
       camera,
       controls,
       pathTracer,
-      pmrem,
       envTex,
       model: null,
       ceilingMesh: null,
@@ -133,7 +134,6 @@ const PathTracerView = forwardRef(function PathTracerView(
       controls.removeEventListener('change', onChange)
       controls.dispose()
       pathTracer.dispose?.()
-      pmrem.dispose()
       envTex.dispose()
       renderer.dispose()
       host.removeChild(renderer.domElement)
@@ -206,6 +206,47 @@ const PathTracerView = forwardRef(function PathTracerView(
     <div ref={hostRef} className="view-host" style={{ position: 'absolute', inset: 0 }} />
   )
 })
+
+// A tiny equirect HDR sky: bright sky above the horizon, dim warm floor below.
+// Returned as a DataTexture (FloatType, RGBA) so three-gpu-pathtracer can read
+// its pixels when building the importance-sampling CDFs.
+function makeGradientEnvTexture() {
+  const w = 64
+  const h = 32
+  const data = new Float32Array(w * h * 4)
+  for (let y = 0; y < h; y++) {
+    // v=0 at the bottom row (DataTexture rows run bottom-to-top with flipY=false)
+    const v = y / (h - 1)
+    for (let x = 0; x < w; x++) {
+      const i = 4 * (y * w + x)
+      if (v > 0.5) {
+        // sky: lerp horizon (1.0, 0.96, 0.88) -> zenith (0.55, 0.72, 1.0), ~2.2x
+        const t = (v - 0.5) * 2
+        data[i + 0] = 2.2 * (1.0 + (0.55 - 1.0) * t)
+        data[i + 1] = 2.2 * (0.96 + (0.72 - 0.96) * t)
+        data[i + 2] = 2.2 * (0.88 + (1.0 - 0.88) * t)
+      } else {
+        // ground: dim warm bounce
+        const t = v * 2
+        data[i + 0] = 0.25 + 0.1 * t
+        data[i + 1] = 0.22 + 0.09 * t
+        data[i + 2] = 0.2 + 0.08 * t
+      }
+      data[i + 3] = 1
+    }
+  }
+  const tex = new THREE.DataTexture(data, w, h, THREE.RGBAFormat, THREE.FloatType)
+  tex.mapping = THREE.EquirectangularReflectionMapping
+  tex.colorSpace = THREE.LinearSRGBColorSpace
+  tex.minFilter = THREE.LinearFilter
+  tex.magFilter = THREE.LinearFilter
+  tex.wrapS = THREE.RepeatWrapping
+  tex.wrapT = THREE.ClampToEdgeWrapping
+  tex.generateMipmaps = false
+  tex.flipY = false
+  tex.needsUpdate = true
+  return tex
+}
 
 function fitCamera(camera, controls, obj) {
   const box = new THREE.Box3().setFromObject(obj)

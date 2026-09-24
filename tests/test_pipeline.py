@@ -209,20 +209,21 @@ def test_elements_json_schema_is_array_of_floor_element():
 
 
 def test_kimi_client_token_fallback(monkeypatch):
-    # Kimi-specific pair wins when both are set
+    # Kimi-specific pair wins when both are set. Modal's proxy wants the token
+    # pair joined with a DOT (the colon form gets a 401).
     monkeypatch.setenv("KIMI_TOKEN_ID", "kid")
     monkeypatch.setenv("KIMI_TOKEN_SECRET", "ksec")
     monkeypatch.setenv("MODAL_TOKEN_ID", "mid")
     monkeypatch.setenv("MODAL_TOKEN_SECRET", "msec")
     monkeypatch.setattr(app, "KIMI_BASE_URL", "https://example.test/v1")
     client = app._kimi_client()
-    assert client.api_key == "kid:ksec"
+    assert client.api_key == "kid.ksec"
 
     # falls back to the Modal workspace tokens
     monkeypatch.delenv("KIMI_TOKEN_ID")
     monkeypatch.delenv("KIMI_TOKEN_SECRET")
     client = app._kimi_client()
-    assert client.api_key == "mid:msec"
+    assert client.api_key == "mid.msec"
 
 
 def test_kimi_client_missing_config_raises(monkeypatch):
@@ -232,3 +233,54 @@ def test_kimi_client_missing_config_raises(monkeypatch):
     with pytest.raises(app.HTTPException) as exc:
         app._kimi_client()
     assert exc.value.status_code == 500
+
+
+# --- Parser selection (Gemini 3.8 Flash option) ------------------------------
+
+@pytest.mark.asyncio
+async def test_extract_elements_dispatches_to_gemini(monkeypatch):
+    called = {}
+
+    async def fake_gemini(image_bytes, mime_type):
+        called["gemini"] = (image_bytes, mime_type)
+        return [app.FloorElement(element_type="wall", box_2d=[1, 2, 3, 4])]
+
+    async def fake_kimi(image_bytes, mime_type):  # pragma: no cover - must not run
+        raise AssertionError("kimi path should not be used for parser='gemini'")
+
+    monkeypatch.setattr(app, "_extract_elements_gemini", fake_gemini)
+    monkeypatch.setattr(app, "_extract_elements_kimi", fake_kimi)
+    out = await app.extract_elements(b"png", "image/png", "gemini")
+    assert called["gemini"] == (b"png", "image/png")
+    assert out[0].element_type == "wall"
+
+
+@pytest.mark.asyncio
+async def test_extract_elements_defaults_to_kimi(monkeypatch):
+    called = {}
+
+    async def fake_kimi(image_bytes, mime_type):
+        called["kimi"] = True
+        return [app.FloorElement(element_type="wall", box_2d=[1, 2, 3, 4])]
+
+    async def fake_gemini(image_bytes, mime_type):  # pragma: no cover - must not run
+        raise AssertionError("gemini path should not be used for parser='kimi'")
+
+    monkeypatch.setattr(app, "_extract_elements_gemini", fake_gemini)
+    monkeypatch.setattr(app, "_extract_elements_kimi", fake_kimi)
+    out = await app.extract_elements(b"png", "image/png")  # no parser arg -> kimi
+    assert called["kimi"] is True
+    assert len(out) == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_elements_gemini_missing_key_raises(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(app.HTTPException) as exc:
+        await app._extract_elements_gemini(b"png", "image/png")
+    assert exc.value.status_code == 500
+    assert "gemini-secret" in exc.value.detail
+
+
+def test_parsers_constant():
+    assert set(app.PARSERS) == {"kimi", "gemini"}

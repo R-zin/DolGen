@@ -9,6 +9,7 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [glb, setGlb] = useState(null)
   const [ceiling, setCeiling] = useState(false)
+  const [parser, setParser] = useState('kimi')
   const [spin, setSpin] = useState(false)
   const [quality, setQuality] = useState(1024)
   const [stats, setStats] = useState(null)
@@ -33,11 +34,13 @@ export default function App() {
   const generate = useCallback(async () => {
     if (!file || busy) return
     setBusy(true)
-    log('Uploading floorplan — extracting structure with Kimi K3…')
+    const parserName = parser === 'gemini' ? 'Gemini 3.8 Flash' : 'Kimi K3'
+    log(`Uploading floorplan — extracting structure with ${parserName}…`)
     try {
       const form = new FormData()
       form.append('file', file)
       form.append('ceiling', ceiling ? 'true' : 'false')
+      form.append('parser', parser)
       const res = await fetch('/generate-3d', { method: 'POST', body: form })
       if (!res.ok) {
         let detail = await res.text()
@@ -64,7 +67,7 @@ export default function App() {
     } finally {
       setBusy(false)
     }
-  }, [file, busy, ceiling, log])
+  }, [file, busy, ceiling, parser, log])
 
   const download = useCallback(() => {
     if (!glb) return
@@ -136,6 +139,14 @@ export default function App() {
           )}
         </div>
         {file && <div className="filename">{file.name}</div>}
+
+        <div className="row">
+          <label htmlFor="parser">Parser</label>
+          <select id="parser" value={parser} onChange={(e) => setParser(e.target.value)}>
+            <option value="kimi">Kimi K3</option>
+            <option value="gemini">Gemini 3.8 Flash</option>
+          </select>
+        </div>
 
         <button className="go" disabled={!file || busy} onClick={generate}>
           Generate Path-Traced Dollhouse
@@ -225,7 +236,8 @@ export default function App() {
             <span>●</span>
           </div>
           <div className="busymsg">
-            Analyzing structure with Kimi K3 — this can take ~10–30 s
+            Analyzing structure with {parser === 'gemini' ? 'Gemini 3.8 Flash' : 'Kimi K3'} — this can
+            take ~10–30 s
           </div>
         </div>
       )}

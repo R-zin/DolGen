@@ -11,6 +11,7 @@ pytest-asyncio
 fastapi
 python-multipart
 openai
+google-genai
 trimesh[all]
 manifold3d>=2.3.0
 scipy

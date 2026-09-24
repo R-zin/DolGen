@@ -14,9 +14,10 @@ Pipeline (per POST /generate-3d request):
      components inside rooms (hatching, furniture strokes, symbols) are
      removed — so the vision model sees clean structure only. On any failure
      the original bytes are used instead.
-  2. Kimi K3 (Moonshot AI vision model, OpenAI-compatible endpoint on Modal,
-     temperature=0.0, JSON-mode) extracts walls / doors / windows as 2D boxes
-     normalized to a 0-1000 image coordinate system.
+  2. A vision model — Kimi K3 (Moonshot AI, OpenAI-compatible endpoint on
+     Modal) or Gemini 3.8 Flash (Google, chosen per request with the `parser`
+     form field) — extracts walls / doors / windows as 2D boxes normalized to
+     a 0-1000 image coordinate system, at temperature=0.0 with JSON output.
   3. Trimesh assembles the dollhouse: 2.5 m walls, boolean-cut door/window
      openings, PBR materials (white walls, light-wood floor).
   4. The merged scene is exported as binary GLTF (.glb) and streamed back with
@@ -29,8 +30,13 @@ three-gpu-pathtracer (progressive path tracing + ACES filmic tone mapping).
 Modal setup (secrets are intentionally NOT baked into this file):
   modal secret create kimi-verify KIMI_BASE_URL=...   # plus KIMI_TOKEN_ID/KIMI_TOKEN_SECRET,
                                                       # or rely on the workspace MODAL_TOKEN_*
+  modal secret create gemini-secret GEMINI_API_KEY=...  # only needed for parser=gemini
   modal serve app.py      # hot-reload playground URL
   modal deploy app.py     # persistent deployment
+
+The app references both secrets; create at least an empty `gemini-secret`
+(`modal secret create gemini-secret GEMINI_API_KEY=placeholder`) so the deploy
+resolves even if you only ever parse with Kimi.
 """
 
 from __future__ import annotations
@@ -48,6 +54,8 @@ import trimesh
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
+from google import genai
+from google.genai import types as genai_types
 from openai import AsyncOpenAI
 from pydantic import BaseModel, field_validator
 
@@ -65,6 +73,7 @@ image = (
         "fastapi",
         "python-multipart",
         "openai",  # Kimi K3 is served over an OpenAI-compatible endpoint
+        "google-genai",  # Gemini 3.8 Flash — the alternative parser
         # trimesh[all] covers the glTF stack; manifold3d lives in trimesh's *easy*
         # extra, not [all], so it must be pinned explicitly for boolean operations.
         "trimesh[all]",
@@ -103,6 +112,16 @@ FLOOR_THICKNESS = 0.10     # meters (floor slab extends downward from z=0)
 KIMI_MODEL = os.environ.get("KIMI_MODEL", "moonshotai/Kimi-K3")
 KIMI_BASE_URL = os.environ.get("KIMI_BASE_URL", "")
 KIMI_TIMEOUT_S = float(os.environ.get("KIMI_TIMEOUT_S", "120"))
+
+# Gemini 3.8 Flash (Google) — the alternative parser, selectable per request
+# with the `parser` form field ("kimi" is the default). Authenticates with the
+# GEMINI_API_KEY env var supplied by the "gemini-secret" Modal secret.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT_S", "120"))
+
+# Vision parsers accepted by the `parser` form field on POST /generate-3d.
+PARSERS = ("kimi", "gemini")
+
 MAX_IMAGE_BYTES = 20 * 1024 * 1024          # 20 MB upload cap
 
 # Cross-origin access for the React dev server / any deployed static frontend.
@@ -216,7 +235,7 @@ def preprocess_floorplan(image_bytes: bytes) -> tuple[bytes, str]:
 
 
 # ---------------------------------------------------------------------------
-# Kimi extraction schema
+# Vision extraction schema (shared by the Kimi and Gemini parsers)
 # ---------------------------------------------------------------------------
 
 class FloorElement(BaseModel):
@@ -234,7 +253,7 @@ class FloorElement(BaseModel):
         return v
 
 
-KIMI_PROMPT = """You are an architectural floorplan understanding engine.
+EXTRACTION_PROMPT = """You are an architectural floorplan understanding engine.
 
 The image is a preprocessed binary wall mask of a floorplan: structural walls are thick BLACK
 lines on a WHITE background. Furniture and interior clutter have already been removed.
@@ -333,7 +352,14 @@ def _parse_elements_text(text: Optional[str]) -> list[FloorElement]:
     return out
 
 
-async def extract_elements(image_bytes: bytes, mime_type: str) -> list[FloorElement]:
+async def extract_elements(image_bytes: bytes, mime_type: str, parser: str = "kimi") -> list[FloorElement]:
+    """Extract structural elements with the chosen vision parser."""
+    if parser == "gemini":
+        return await _extract_elements_gemini(image_bytes, mime_type)
+    return await _extract_elements_kimi(image_bytes, mime_type)
+
+
+async def _extract_elements_kimi(image_bytes: bytes, mime_type: str) -> list[FloorElement]:
     """Call Kimi K3 on the (preprocessed) floorplan; return validated elements."""
     client = _kimi_client()
     b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -348,7 +374,7 @@ async def extract_elements(image_bytes: bytes, mime_type: str) -> list[FloorElem
                         "type": "image_url",
                         "image_url": {"url": f"data:{mime_type};base64,{b64}"},
                     },
-                    {"type": "text", "text": KIMI_PROMPT},
+                    {"type": "text", "text": EXTRACTION_PROMPT},
                 ],
             }
         ],
@@ -376,6 +402,48 @@ async def extract_elements(image_bytes: bytes, mime_type: str) -> list[FloorElem
         raise HTTPException(
             status_code=422,
             detail="Kimi returned no extractable elements for this floorplan image.",
+        )
+    return parsed
+
+
+async def _extract_elements_gemini(image_bytes: bytes, mime_type: str) -> list[FloorElement]:
+    """Call Gemini 3.8 Flash on the (preprocessed) floorplan; return validated elements."""
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Gemini parser is not configured — the 'gemini-secret' Modal secret must "
+                "set GEMINI_API_KEY."
+            ),
+        )
+    try:
+        client = genai.Client(  # picks credentials up from the GEMINI_API_KEY env var
+            http_options=genai_types.HttpOptions(timeout=int(GEMINI_TIMEOUT_S * 1000)),
+        )
+    except Exception as exc:  # pragma: no cover - depends on runtime secrets
+        raise HTTPException(status_code=500, detail=f"Gemini client could not be created: {exc}")
+
+    try:
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                EXTRACTION_PROMPT,
+            ],
+            config=genai_types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Gemini analysis failed: {exc}")
+
+    text = getattr(response, "text", None)
+    parsed = _parse_elements_text(text() if callable(text) else text)
+    if not parsed:
+        raise HTTPException(
+            status_code=422,
+            detail="Gemini returned no extractable elements for this floorplan image.",
         )
     return parsed
 
@@ -685,7 +753,14 @@ def create_app() -> FastAPI:
         file: UploadFile = File(...),
         ceiling: str = Form("false"),
         room_colors: str = Form(""),
+        parser: str = Form("kimi"),
     ) -> StreamingResponse:
+        parser = parser.strip().lower() or "kimi"
+        if parser not in PARSERS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown parser '{parser}'. Supported parsers: {', '.join(PARSERS)}.",
+            )
         mime = (file.content_type or "").lower()
         data = await file.read()
         if not data:
@@ -712,13 +787,16 @@ def create_app() -> FastAPI:
             logger.warning("Preprocessing failed (%s); using raw upload", exc)
             prep_logs.append("Preprocessing failed — using the raw image.")
 
-        parsed = await extract_elements(data, mime)
+        parsed = await extract_elements(data, mime, parser)
         elements = normalize_elements(parsed)
         if not elements:
             raise HTTPException(status_code=422, detail="No usable elements were detected in the floorplan.")
         if not any(e["element_type"] == "wall" for e in elements):
             # Walls are the backbone of the dollhouse; without them the output is misleading.
-            raise HTTPException(status_code=422, detail="Kimi detected no walls in this floorplan.")
+            raise HTTPException(
+                status_code=422,
+                detail=f"{parser.capitalize()} detected no walls in this floorplan.",
+            )
 
         # Optional per-room wall colors sent by the client.
         colors: Optional[dict[str, Any]] = None
@@ -735,7 +813,8 @@ def create_app() -> FastAPI:
             elements, include_ceiling=include_ceiling, room_colors=colors
         )
 
-        logs = prep_logs + scene_logs
+        parser_label = "Kimi K3" if parser == "kimi" else f"Gemini 3.8 Flash ({GEMINI_MODEL})"
+        logs = [f"Parsed structure with {parser_label}."] + prep_logs + scene_logs
         logger.info("generate_3d ok: %s", " | ".join(logs))
         # HTTP headers are latin-1; keep the pipeline log ASCII-safe for the wire.
         header_log = " | ".join(logs).encode("ascii", "replace").decode("ascii")[:1800]
@@ -755,6 +834,10 @@ def create_app() -> FastAPI:
     image=image,
     secrets=[
         modal.Secret.from_name("kimi-verify"),
+        # Gemini is opt-in per request; the secret only needs GEMINI_API_KEY.
+        # Create it with any value (even a placeholder) so the deploy resolves
+        # — parser=gemini returns a clear 500 until a real key is set.
+        modal.Secret.from_name("gemini-secret"),
     ],
     timeout=600,
     memory=2048,
@@ -831,6 +914,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .dots span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%,80%,100% { opacity:.15; } 40% { opacity:1; } }
   #busymsg { font-size: 13px; color: #c7ceda; }
+  #parser {
+    background: #20242a; color: #e8eaed; border: 1px solid #3a404c; border-radius: 6px;
+    padding: 4px 6px; font-size: 12.5px; cursor: pointer;
+  }
   .row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #aeb6c2; flex-wrap: wrap; }
   .row label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
   .row input[type="checkbox"] { accent-color: #e8b04b; width: 15px; height: 15px; cursor: pointer; }
@@ -854,6 +941,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div id="filename"></div>
     <button id="go" disabled>Generate Path-Traced Dollhouse</button>
     <div class="row">
+      <label for="parser">Parser</label>
+      <select id="parser">
+        <option value="kimi" selected>Kimi K3</option>
+        <option value="gemini">Gemini 3.8 Flash</option>
+      </select>
+    </div>
+    <div class="row">
       <label><input type="checkbox" id="ceil" /> Ceiling / roof</label>
       <label><input type="checkbox" id="spin" /> Auto-rotate</label>
     </div>
@@ -869,7 +963,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <main id="view">
     <div id="empty"><div class="big">📐 → 🏠</div><div>Upload a floorplan to render your dollhouse.<br/>Progressive path tracing will converge once the model loads.</div></div>
   </main>
-  <div id="busy"><div class="dots"><span>●</span><span>●</span><span>●</span></div><div id="busymsg">Analyzing with Kimi K3 — this takes ~10–30 s</div></div>
+  <div id="busy"><div class="dots"><span>●</span><span>●</span><span>●</span></div><div id="busymsg">Analyzing floorplan structure — this takes ~10–30 s</div></div>
 
 <script type="importmap">
 {
@@ -899,6 +993,7 @@ const filenameEl = document.getElementById('filename');
 const viewEl = document.getElementById('view');
 const ceilEl = document.getElementById('ceil');
 const spinEl = document.getElementById('spin');
+const parserEl = document.getElementById('parser');
 const dlEl = document.getElementById('dl');
 const qualityEl = document.getElementById('quality');
 const qualityValEl = document.getElementById('qualityVal');
@@ -1029,11 +1124,13 @@ async function generate() {
   if (!pickedFile) return;
   goBtn.disabled = true;
   busyEl.classList.add('show');
-  log('Uploading floorplan to Kimi K3…');
+  const parserName = parserEl.value === 'gemini' ? 'Gemini 3.8 Flash' : 'Kimi K3';
+  log(`Uploading floorplan to ${parserName}…`);
   try {
     const form = new FormData();
     form.append('file', pickedFile);
     form.append('ceiling', ceilEl.checked ? 'true' : 'false');
+    form.append('parser', parserEl.value);
     const res = await fetch('/generate-3d', { method: 'POST', body: form });
     if (!res.ok) {
       let detail = await res.text();

@@ -1,0 +1,8 @@
+HTTP/2 422 
+alt-svc: h3=":443"; ma=2592000
+content-type: application/json
+date: Thu, 24 Sep 2026 06:57:05 GMT
+modal-function-call-id: fc-01M39383DBBXXQGXEH2AT5VKY7
+vary: accept-encoding
+content-length: 231
+
